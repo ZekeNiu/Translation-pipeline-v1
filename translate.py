@@ -16,6 +16,7 @@ import re
 import sys
 import time
 
+from inline_semantics import find_inline_artifacts, normalize_inline_output, protect_inline_semantics
 from mineru_sidecar import load_mineru_sidecar, strip_excluded_lines, write_sidecar_summary
 from table_utils import html_table_blocks, iter_cells, parse_html_tables, render_html_table
 
@@ -151,14 +152,9 @@ def resolve_provider_config(
 REFERENCE_HEADING_RE = re.compile(
     r"(?im)^#{1,6}\s*(references|bibliography|works\s+cited|literature\s+cited|参考文献|參考文獻)\s*$"
 )
+REFERENCE_ITEM_RE = re.compile(r"^\s*(?:\[(?P<bracket>\d{1,4})\]|(?P<dot>\d{1,4})\.)\s+")
 TABLE_RE = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
 IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
-MATH_PATTERNS = [
-    re.compile(r"\$\$.*?\$\$", re.DOTALL),
-    re.compile(r"\\\[.*?\\\]", re.DOTALL),
-    re.compile(r"\\\(.*?\\\)", re.DOTALL),
-    re.compile(r"(?<!\\)\$(?!\$)(?:\\.|[^\n$])+(?<!\\)\$"),
-]
 
 
 def normalize_source_text(text: str) -> str:
@@ -183,6 +179,63 @@ def split_references(md_text: str) -> tuple[str, str]:
     return body, refs
 
 
+def normalize_references(refs: str) -> tuple[str, dict]:
+    refs = normalize_inline_output(normalize_source_text(refs))
+    lines = refs.splitlines()
+    if not lines:
+        return "", {"entries": 0, "continuation_lines_merged": 0, "numbering_jumps": []}
+
+    heading = lines[0].strip()
+    entries: list[str] = []
+    preamble: list[str] = []
+    current: list[str] = []
+    current_number: int | None = None
+    previous_number: int | None = None
+    continuation_lines_merged = 0
+    numbering_jumps: list[dict[str, int]] = []
+
+    def flush_current():
+        nonlocal current
+        if current:
+            entries.append(re.sub(r"\s+", " ", " ".join(current)).strip())
+            current = []
+
+    for raw_line in lines[1:]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = REFERENCE_ITEM_RE.match(line)
+        if match:
+            flush_current()
+            number = int(match.group("bracket") or match.group("dot"))
+            if previous_number is not None and number != previous_number + 1:
+                numbering_jumps.append({"from": previous_number, "to": number})
+            previous_number = number
+            current_number = number
+            current = [line]
+            continue
+        if current_number is None:
+            preamble.append(line)
+        else:
+            current.append(line)
+            continuation_lines_merged += 1
+    flush_current()
+
+    normalized_lines = [heading]
+    if preamble:
+        normalized_lines.extend(["", re.sub(r"\s+", " ", " ".join(preamble)).strip()])
+    if entries:
+        normalized_lines.append("")
+        normalized_lines.extend(entries)
+    normalized = "\n\n".join(part for part in normalized_lines if part).strip() + "\n"
+    report = {
+        "entries": len(entries),
+        "continuation_lines_merged": continuation_lines_merged,
+        "numbering_jumps": numbering_jumps,
+    }
+    return normalized, report
+
+
 def _store_placeholder(kind: str, value: str, placeholders: dict[str, str]) -> str:
     token = f"[[[TP_{kind}_{len(placeholders):04d}]]]"
     placeholders[token] = value
@@ -201,16 +254,14 @@ def protect_fragments(text: str) -> tuple[str, dict[str, str]]:
     text = TABLE_RE.sub(protect_table, text)
     text = IMAGE_RE.sub(protect_image, text)
 
-    for pattern in MATH_PATTERNS:
-        text = pattern.sub(lambda m: _store_placeholder("MATH", m.group(0), placeholders), text)
-
+    text = protect_inline_semantics(text, lambda kind, value: _store_placeholder(kind, value, placeholders))
     return text, placeholders
 
 
 def restore_placeholders(text: str, placeholders: dict[str, str]) -> str:
     for token, value in placeholders.items():
         text = text.replace(token, value)
-    return text
+    return normalize_inline_output(text)
 
 
 def clean_translation_text(text: str) -> str:
@@ -452,13 +503,14 @@ def build_consistency_guide(source_text: str) -> str:
     acronyms = re.findall(r"\b(?:[A-Z]{2,}[A-Za-z0-9]*|[A-Z]+[0-9]+[A-Za-z]*)\b", source_text)
     acronyms = [a for a in acronyms if len(a) <= 20 and a not in {"PDF", "DOI", "ISSN"}]
 
-    technical_terms = re.findall(
-        r"\b[A-Za-z]+(?:-[A-Za-z]+)+(?:\s+[A-Za-z]+(?:-[A-Za-z]+)*){0,3}\b",
-        source_text,
-    )
-
-    acronym_list = _top_items(acronyms, 45)
-    term_list = _top_items(technical_terms, 30)
+    acronym_counts = {}
+    for item in acronyms:
+        acronym_counts[item] = acronym_counts.get(item, 0) + 1
+    acronym_list = [
+        item
+        for item, count in sorted(acronym_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if count >= 2
+    ][:45]
 
     lines = [
         "Consistency constraints for this document:",
@@ -469,9 +521,29 @@ def build_consistency_guide(source_text: str) -> str:
     ]
     if acronym_list:
         lines.append("- Preserve these acronyms exactly unless the source itself expands them: " + ", ".join(acronym_list))
-    if term_list:
-        lines.append("- Translate these recurring technical terms consistently when they appear in prose: " + "; ".join(term_list))
     return "\n".join(lines)
+
+
+def extract_term_audit_candidates(source_text: str, limit: int = 80) -> list[str]:
+    source_text = TABLE_RE.sub(" ", source_text)
+    source_text = IMAGE_RE.sub(" ", source_text)
+    candidates = re.findall(
+        r"\b[A-Z]?[a-z]+(?:-[A-Za-z]+|\s+[A-Z]?[a-z]+){1,5}\b",
+        source_text,
+    )
+    blocked = {"et al", "in vivo", "in vitro"}
+    out = []
+    seen = set()
+    for item in _top_items(candidates, limit * 2):
+        key = item.lower()
+        if key in blocked:
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def find_untranslated_english(text: str, limit: int = 8) -> list[str]:
@@ -497,6 +569,59 @@ def find_untranslated_english(text: str, limit: int = 8) -> list[str]:
             out.append(cand)
         if len(out) >= limit:
             break
+    return out
+
+
+def find_untranslated_table_english(text: str, limit: int = 8) -> list[str]:
+    cleaned = re.sub(r"\[[^\]]+\]", " ", text)
+    cleaned = re.sub(r"\b(?:HIT|RST|SIT|VO2max|VO₂max|DOI|ISBN|ISSN)\b", " ", cleaned)
+    cleaned = re.sub(r"[ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ⁰¹²³⁴⁵⁶⁷⁸⁹]+", "", cleaned)
+    phrases = re.findall(r"\b[A-Z]?[a-z]{3,}(?:[- ][A-Z]?[a-z]{2,})+\b|\b[A-Z][a-z]{3,}\b", cleaned)
+    out = []
+    seen = set()
+    for phrase in phrases:
+        key = phrase.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(phrase)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def analyze_table_quality(translated_texts: list[str]) -> dict[str, list[str]]:
+    residual_english: list[str] = []
+    inline_artifacts: list[str] = []
+    for text in translated_texts:
+        for item in find_untranslated_table_english(text, limit=3):
+            if item not in residual_english:
+                residual_english.append(item)
+        for item in find_inline_artifacts(text):
+            if item not in inline_artifacts:
+                inline_artifacts.append(item)
+    return {
+        "residual_english": residual_english[:12],
+        "inline_artifacts": inline_artifacts,
+    }
+
+
+def find_latex_artifacts(text: str, limit: int = 30) -> list[str]:
+    patterns = [
+        r"\\(?:mathrm|operatorname|textsuperscript|textsubscript|textregistered|textcopyright|texttrademark|frac|dot)\b",
+        r"\\[A-Za-z]{2,}\b",
+        r"\b(?:mathrm|operatorname|textsuperscript|textsubscript|textregistered|textcopyright|texttrademark)\b",
+    ]
+    out = []
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            item = match.group(0)
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+            if len(out) >= limit:
+                return out
     return out
 
 
@@ -691,16 +816,21 @@ def translate_tables_in_text(
             failures=failures,
         )
         for cell, translated in zip(cells, translated_texts):
-            cell.text = translated
+            cell.text = normalize_inline_output(translated)
+        quality = analyze_table_quality([cell.text for cell in cells])
         report = {
             "cells": len(source_texts),
             "translated_cells": sum(1 for src, dst in zip(source_texts, translated_texts) if src != dst),
             "failures": failures,
+            "residual_english": quality["residual_english"],
+            "inline_artifacts": quality["inline_artifacts"],
         }
         if table_reports is not None:
             table_reports.append(report)
         if failures:
             progress(f"⚠️ Table translated with {len(failures)} cell fallback(s)")
+        elif quality["residual_english"] or quality["inline_artifacts"]:
+            progress("⚠️ Table translated with quality warnings")
         else:
             progress(f"✓ Table translated ({report['translated_cells']}/{report['cells']} changed)")
         return "\n" + "\n".join(render_html_table(table) for table in tables) + "\n"
@@ -846,13 +976,17 @@ def run(
         )
 
     consistency_guide = build_consistency_guide(raw)
+    term_audit_candidates = extract_term_audit_candidates(raw)
     translation_memory: dict[str, str] = {}
     table_reports: list[dict] = []
     quality_warnings: list[dict] = []
+    reference_report = {"entries": 0, "continuation_lines_merged": 0, "numbering_jumps": []}
 
     body_raw, refs = split_references(raw)
     if refs:
         (out_dir / "references_original.md").write_text(refs, encoding="utf-8")
+        refs, reference_report = normalize_references(refs)
+        (out_dir / "references_normalized.md").write_text(refs, encoding="utf-8")
 
     progress("📊 Translating table cells...")
     body_raw = translate_tables_in_text(
@@ -973,6 +1107,8 @@ def run(
     result = "\n".join(body_lines).strip()
     if refs:
         result = result.rstrip() + "\n\n" + refs.strip() + "\n"
+    result = normalize_inline_output(result)
+    latex_artifacts = find_latex_artifacts(result)
 
     out_md = out_dir / "translated.md"
     out_md.write_text(result, encoding="utf-8")
@@ -1003,6 +1139,9 @@ def run(
         f"Sidecar formulas found: {len(sidecar.formula_texts)}\n"
         f"Table reports: {json.dumps(table_reports, ensure_ascii=False)}\n"
         f"Quality warnings: {json.dumps(quality_warnings, ensure_ascii=False)}\n"
+        f"Reference normalization: {json.dumps(reference_report, ensure_ascii=False)}\n"
+        f"LaTeX artifacts: {json.dumps(latex_artifacts, ensure_ascii=False)}\n"
+        f"Term audit candidates: {json.dumps(term_audit_candidates[:40], ensure_ascii=False)}\n"
         f"Speed mode: {speed_mode}, workers: {workers}\n"
         f"Time: {time.strftime('%Y-%m-%d %H:%M')}\n",
         encoding="utf-8",

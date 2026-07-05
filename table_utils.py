@@ -5,6 +5,8 @@ from html import escape
 from html.parser import HTMLParser
 import re
 
+INLINE_TAGS = {"sup", "sub", "i", "em", "b", "strong"}
+
 
 @dataclass
 class TableCell:
@@ -46,6 +48,8 @@ class _HTMLTableParser(HTMLParser):
             self._cell_parts = []
         elif tag == "br" and self._cell is not None:
             self._cell_parts.append("\n")
+        elif tag in INLINE_TAGS and self._cell is not None:
+            self._cell_parts.append(f"<{tag}>")
 
     def handle_data(self, data):
         if self._cell is not None:
@@ -58,6 +62,8 @@ class _HTMLTableParser(HTMLParser):
             self._row.cells.append(self._cell)
             self._cell = None
             self._cell_parts = []
+        elif tag in INLINE_TAGS and self._cell is not None:
+            self._cell_parts.append(f"</{tag}>")
         elif tag == "tr" and self._row is not None and self._table is not None:
             self._table.rows.append(self._row)
             self._row = None
@@ -97,6 +103,9 @@ def render_html_table(table: ParsedTable) -> str:
         cells = []
         for cell in row.cells:
             text = escape(cell.text, quote=False).replace("\n", "<br/>")
+            for tag in INLINE_TAGS:
+                text = text.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+                text = text.replace(f"&lt;/{tag}&gt;", f"</{tag}>")
             cells.append(f"<{cell.tag}{_attrs_to_html(cell.attrs)}>{text}</{cell.tag}>")
         rows.append(f"<tr{_attrs_to_html(row.attrs)}>{''.join(cells)}</tr>")
     return f"<table{_attrs_to_html(table.attrs)}>{''.join(rows)}</table>"

@@ -29,7 +29,10 @@ class PipelineQualityTests(unittest.TestCase):
         text = r"$v_{VO2max}$ and $\frac{a}{b}$ and $T@\dot{V}O_2max$"
         protected, placeholders = translate.protect_fragments(text)
         self.assertNotIn(r"\frac{a}{b}", protected)
-        self.assertEqual(translate.restore_placeholders(protected, placeholders), text)
+        restored = translate.restore_placeholders(protected, placeholders)
+        self.assertIn("a/b", restored)
+        self.assertIn("T@V̇O₂max", restored)
+        self.assertNotIn(r"\frac", restored)
         self.assertEqual(translate.clean_latex(text), text)
 
     def test_reference_headings_are_isolated(self):
@@ -42,6 +45,23 @@ class PipelineQualityTests(unittest.TestCase):
                 chunks, refs2 = translate.segment_document(f"## Body\ntext\n\n{heading}\n1. Smith")
                 self.assertEqual(len(chunks), 1)
                 self.assertTrue(refs2.startswith(heading))
+
+    def test_reference_continuation_lines_are_merged(self):
+        refs = (
+            "## References\n\n"
+            "15. Krustrup P, Ortenblad N. Maximal voluntary contraction force during\n\n"
+            "the first 72 h after a high-level competitive soccer game. Eur J Appl Physiol. 2011;111:2987-95.\n\n"
+            "[16] Next Author. Next title. Journal. 2000;1:1-2.\n"
+        )
+        normalized, report = translate.normalize_references(refs)
+        self.assertIn(
+            "15. Krustrup P, Ortenblad N. Maximal voluntary contraction force during the first 72 h",
+            normalized,
+        )
+        self.assertIn("[16] Next Author.", normalized)
+        self.assertNotIn("\n\nthe first 72 h", normalized)
+        self.assertEqual(report["entries"], 2)
+        self.assertEqual(report["continuation_lines_merged"], 1)
 
     def test_provider_endpoint_appends_chat_completions(self):
         cfg = translate.resolve_provider_config(
@@ -68,6 +88,15 @@ class PipelineQualityTests(unittest.TestCase):
         self.assertEqual(latex_to_readable_text(r"$\geq 95$"), "≥ 95")
         self.assertEqual(latex_to_readable_text(r"$T@\dot{V}O_2max$"), "T@V̇O₂max")
         self.assertEqual(latex_to_readable_text(r"$V_{IFT}$"), "VIFT")
+
+    def test_latex_text_macros_do_not_leak_as_words(self):
+        source = r"$2 0 \mathrm { ~ s ~ } \textsuperscript { \textregistered } \textsuperscript { 1 7 0 \% }$"
+        out = latex_to_readable_text(source)
+        self.assertIn("®", out)
+        self.assertIn("¹⁷⁰%", out)
+        self.assertNotIn("textsuperscript", out)
+        self.assertNotIn("textregistered", out)
+        self.assertNotIn("mathrm", out)
 
     def test_docx_renders_formula_readably(self):
         formula = r"$[ \mathrm { v / p } \dot { V } \mathrm { O } _ { 2 \operatorname* { m a x } } ]$"
@@ -119,7 +148,7 @@ class PipelineQualityTests(unittest.TestCase):
             first = translate.translate_segment("A formula $x_1$ stays.", "", 1, 1, cfg, cache_dir)
             second = translate.translate_segment("A formula $x_1$ stays.", "", 1, 1, cfg, cache_dir)
             self.assertEqual(first, second)
-            self.assertIn("$x_1$", first)
+            self.assertIn("x₁", first)
             self.assertEqual(len(calls), 1)
 
     def test_consistency_guide_does_not_preserve_body_phrases_in_english(self):
@@ -127,9 +156,10 @@ class PipelineQualityTests(unittest.TestCase):
             "## 2.1 Anaerobic Glycolytic Energy Contribution to HIT\n\n"
             "While the accumulated oxygen deficit is useful, high-intensity interval training matters."
         )
-        self.assertIn("Translate these recurring technical terms consistently", guide)
+        self.assertIn("Reuse the same Chinese wording", guide)
         self.assertNotIn("Preserve these names/entities", guide)
-        self.assertNotIn("Anaerobic Glycolytic Energy Contribution", guide.split("Preserve")[-1])
+        self.assertNotIn("Anaerobic Glycolytic Energy Contribution", guide)
+        self.assertIn("high-intensity interval", "; ".join(translate.extract_term_audit_candidates(guide + " high-intensity interval training")))
 
     def test_untranslated_english_detection_finds_long_body_phrase(self):
         warnings = translate.find_untranslated_english("在本节中，Anaerobic Glycolytic Energy Contribution 对HIT参数具有依赖性。")
@@ -154,6 +184,71 @@ class PipelineQualityTests(unittest.TestCase):
             self.assertIn("<table", out)
             self.assertIn("形式", out)
             self.assertIn("时长", out)
+
+    def test_mixed_math_text_and_html_superscripts_remain_translatable(self):
+        cfg = ProviderConfig(
+            provider_name="custom",
+            base_url="https://example.test/v1",
+            api_key_env="AI_API_KEY",
+            api_key="test-key",
+            model="test-model",
+        )
+        seen_items = []
+
+        def fake_call(_config, messages, timeout=None):
+            items = json.loads(messages[-1]["content"])
+            seen_items.extend(items)
+            translated = []
+            for item in items:
+                translated.append(
+                    item.replace("Work intensity", "工作强度")
+                    .replace("Ground surface", "地面类型")
+                    .replace("Sport specific", "专项运动")
+                )
+            return json.dumps(translated, ensure_ascii=False)
+
+        html = (
+            "<table><tr>"
+            "<td>$Work intensity^a$</td>"
+            "<td>Ground surface<sup>b</sup></td>"
+            "<td>$Sport specific^f$</td>"
+            "</tr></table>"
+        )
+        reports = []
+        with tempfile.TemporaryDirectory() as td, patch("translate.call_chat_completion", fake_call):
+            out = translate.translate_tables_in_text(
+                html,
+                cfg,
+                Path(td),
+                lambda *_args, **_kw: None,
+                table_reports=reports,
+            )
+            self.assertTrue(any("Work intensity" in item for item in seen_items))
+            self.assertIn("工作强度ᵃ", out)
+            self.assertIn("地面类型ᵇ", out)
+            self.assertIn("专项运动ᶠ", out)
+            self.assertNotIn("<sup>", out)
+            self.assertNotIn("$Work intensity", out)
+            self.assertEqual(reports[0]["residual_english"], [])
+            self.assertEqual(reports[0]["inline_artifacts"], [])
+
+    def test_docx_uses_real_script_runs_for_unicode_scripts(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "scripts.docx"
+            make_docx("# Title\n\n工作强度ᵃ and O₂.", out, Path(td))
+            doc = Document(str(out))
+            runs = doc.paragraphs[1].runs
+            self.assertTrue(any(run.text == "ᵃ" and run.font.superscript for run in runs))
+            self.assertTrue(any(run.text == "₂" and run.font.subscript for run in runs))
+
+    def test_docx_reference_mode_uses_reference_style_for_continuations(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "refs.docx"
+            make_docx("# Title\n\n## References\n\nContinuation without number.", out, Path(td))
+            doc = Document(str(out))
+            paragraph = doc.paragraphs[2]
+            self.assertEqual(round(paragraph.runs[0].font.size.pt), 8)
+            self.assertLess(paragraph.paragraph_format.first_line_indent, 0)
 
     def test_table_translation_falls_back_per_cell_not_whole_table(self):
         cfg = ProviderConfig(
@@ -211,7 +306,11 @@ class PipelineQualityTests(unittest.TestCase):
             root = Path(td) / "mineru"
             root.mkdir()
             (root / "a.md").write_text("# Wrong\n\nWrong file", encoding="utf-8")
-            (root / "full.md").write_text("# Right\n\nJournal Header\n\nRight file\n\n## References\n1. Smith.", encoding="utf-8")
+            (root / "full.md").write_text(
+                "# Right\n\nJournal Header\n\nRight file\n\n"
+                "## References\n\n1. Smith title during\n\ncontinuation line.\n\n2. Jones title.",
+                encoding="utf-8",
+            )
             (root / "doc_content_list_v2.json").write_text(
                 json.dumps([[{"type": "page_header", "content": {"paragraph_content": [{"type": "text", "content": "Journal Header"}]}}]]),
                 encoding="utf-8",
@@ -222,6 +321,10 @@ class PipelineQualityTests(unittest.TestCase):
             self.assertIn("# Right", result)
             self.assertNotIn("Wrong file", result)
             self.assertNotIn("Journal Header", result)
+            self.assertIn("1. Smith title during continuation line.", result)
+            self.assertTrue((out / "references_original.md").exists())
+            self.assertTrue((out / "references_normalized.md").exists())
+            self.assertIn("Reference normalization:", (out / "translation.log").read_text(encoding="utf-8"))
             self.assertTrue((out / "mineru_structure_summary.json").exists())
 
 

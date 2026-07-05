@@ -52,6 +52,30 @@ SUP = str.maketrans(
         "+": "⁺",
         "-": "⁻",
         "n": "ⁿ",
+        "a": "ᵃ",
+        "b": "ᵇ",
+        "c": "ᶜ",
+        "d": "ᵈ",
+        "e": "ᵉ",
+        "f": "ᶠ",
+        "g": "ᵍ",
+        "h": "ʰ",
+        "i": "ⁱ",
+        "j": "ʲ",
+        "k": "ᵏ",
+        "l": "ˡ",
+        "m": "ᵐ",
+        "o": "ᵒ",
+        "p": "ᵖ",
+        "r": "ʳ",
+        "s": "ˢ",
+        "t": "ᵗ",
+        "u": "ᵘ",
+        "v": "ᵛ",
+        "w": "ʷ",
+        "x": "ˣ",
+        "y": "ʸ",
+        "z": "ᶻ",
     }
 )
 
@@ -93,6 +117,14 @@ SYMBOLS = {
     r"\,": " ",
     r"\:": " ",
     r"\;": " ",
+}
+
+TEXT_SYMBOLS = {
+    r"\textregistered": "®",
+    r"\textcopyright": "©",
+    r"\texttrademark": "™",
+    r"\textdegree": "°",
+    r"\degree": "°",
 }
 
 MATH_SPAN_RE = re.compile(
@@ -145,6 +177,20 @@ def _replace_frac(expr: str) -> str:
     return expr
 
 
+def _replace_text_script(expr: str, command: str, kind: str) -> str:
+    pattern = re.compile(rf"\\{command}\s*\{{([^{{}}]*)\}}")
+    trans = SUB if kind == "_" else SUP
+    for _ in range(8):
+        new = pattern.sub(
+            lambda m: re.sub(r"\s+", "", latex_formula_to_readable(m.group(1), strip_delimiters=False)).translate(trans),
+            expr,
+        )
+        if new == expr:
+            break
+        expr = new
+    return expr
+
+
 def _format_script(content: str, kind: str) -> str:
     trans = SUB if kind == "_" else SUP
     content = latex_formula_to_readable(content, strip_delimiters=False)
@@ -154,6 +200,8 @@ def _format_script(content: str, kind: str) -> str:
         return match.group(1).translate(trans) + match.group(2)
     if re.fullmatch(r"[0-9+\-a-z]+", content):
         return content.translate(trans)
+    if kind == "_" and re.fullmatch(r"[A-Za-z]*[0-9][A-Za-z0-9]*", content):
+        return re.sub(r"\d+", lambda m: m.group(0).translate(trans), content)
     match = re.fullmatch(r"([0-9+\-]+)([A-Za-z]+)", content)
     if match:
         return match.group(1).translate(trans) + match.group(2)
@@ -174,8 +222,12 @@ def latex_formula_to_readable(expr: str, strip_delimiters: bool = True) -> str:
             lambda m: m.group(1) + "\u0307",
             expr,
         )
+        for key, value in TEXT_SYMBOLS.items():
+            expr = expr.replace(key, value)
         for command in ("operatorname", "mathrm", "mathbf", "mathit", "text", "mbox", "textit", "textbf"):
             expr = _replace_group_command(expr, command)
+        expr = _replace_text_script(expr, "textsuperscript", "^")
+        expr = _replace_text_script(expr, "textsubscript", "_")
         for key, value in {**GREEK, **SYMBOLS}.items():
             expr = expr.replace(key, value)
 
@@ -185,7 +237,7 @@ def latex_formula_to_readable(expr: str, strip_delimiters: bool = True) -> str:
         expr = re.sub(r"\^\s*([A-Za-z0-9+\-])", lambda m: m.group(1).translate(SUP), expr)
 
         expr = re.sub(r"[{}]", "", expr)
-        expr = re.sub(r"\\+", "", expr)
+        expr = re.sub(r"\\(?=\s|[,.;:])", "", expr)
         expr = re.sub(r"\s*/\s*", "/", expr)
         expr = re.sub(r"\s+([,\.;:\]\)])", r"\1", expr)
         expr = re.sub(r"([\[\(])\s+", r"\1", expr)

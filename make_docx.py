@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-from latex_utils import latex_to_readable_text
+from inline_semantics import iter_styled_runs, normalize_inline_output
 from table_utils import parse_html_tables
 
 try:
@@ -31,6 +31,10 @@ CITATION_SIZE = 8
 TABLE_SIZE = 8.5
 CITE_RE = re.compile(r"(\[\d+(?:[,\s\u2013–-]+\d+)*\])")
 XML_BAD_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+REFERENCE_HEADING_TEXT_RE = re.compile(
+    r"^(references|bibliography|works\s+cited|literature\s+cited|参考文献|參考文獻)$",
+    re.IGNORECASE,
+)
 
 
 def set_font(run, bold=False, italic=False, size=None):
@@ -51,17 +55,22 @@ def set_font(run, bold=False, italic=False, size=None):
 
 def _add_text_runs(paragraph, text: str, size=BODY_SIZE, bold=False, italic=False):
     text = XML_BAD_CHAR_RE.sub("", text)
-    text = latex_to_readable_text(text)
-    parts = CITE_RE.split(text)
-    for part in parts:
-        if not part:
-            continue
-        run = paragraph.add_run(part)
-        if CITE_RE.fullmatch(part):
-            run.font.superscript = True
-            set_font(run, size=CITATION_SIZE)
-        else:
-            set_font(run, bold=bold, italic=italic, size=size)
+    text = normalize_inline_output(text)
+    for styled in iter_styled_runs(text):
+        parts = CITE_RE.split(styled.text)
+        for part in parts:
+            if not part:
+                continue
+            run = paragraph.add_run(part)
+            is_citation = bool(CITE_RE.fullmatch(part))
+            run.font.superscript = styled.superscript or is_citation
+            run.font.subscript = styled.subscript and not is_citation
+            set_font(
+                run,
+                bold=bold or styled.bold,
+                italic=italic or styled.italic,
+                size=CITATION_SIZE if is_citation else size,
+            )
 
 
 def _paragraph(doc, text: str, size=BODY_SIZE, first_indent=True, italic=False, bold=False):
@@ -73,6 +82,20 @@ def _paragraph(doc, text: str, size=BODY_SIZE, first_indent=True, italic=False, 
     pf.line_spacing = LINE_SPACING
     pf.space_after = Pt(2)
     _add_text_runs(p, text, size=size, bold=bold, italic=italic)
+    return p
+
+
+def _is_reference_heading(text: str) -> bool:
+    return bool(REFERENCE_HEADING_TEXT_RE.fullmatch(text.strip()))
+
+
+def _reference_paragraph(doc, text: str):
+    p = _paragraph(doc, text, size=8, first_indent=False)
+    pf = p.paragraph_format
+    pf.left_indent = Cm(0.45)
+    pf.first_line_indent = Cm(-0.45)
+    pf.space_after = Pt(1)
+    pf.line_spacing = 1.0
     return p
 
 
@@ -186,6 +209,7 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
 
     lines = md_text.splitlines()
     i = 0
+    reference_mode = False
     while i < len(lines):
         line = lines[i]
         s = line.strip()
@@ -214,6 +238,12 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
             p = doc.add_heading(text, level=lv)
             for r in p.runs:
                 set_font(r, bold=True)
+            reference_mode = _is_reference_heading(text)
+            i += 1
+            continue
+
+        if reference_mode:
+            _reference_paragraph(doc, s)
             i += 1
             continue
 
