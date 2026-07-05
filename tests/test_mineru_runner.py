@@ -1,0 +1,80 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import mineru_runner
+
+
+class MinerURunnerTests(unittest.TestCase):
+    def test_locate_output_prefers_full_md(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "nested").mkdir()
+            (root / "nested" / "other.md").write_text("other", encoding="utf-8")
+            (root / "deep").mkdir()
+            (root / "deep" / "full.md").write_text("full", encoding="utf-8")
+            self.assertEqual(mineru_runner.locate_mineru_output_folder(root), root / "deep")
+
+    def test_local_cli_uses_pipeline_backend_when_requested(self):
+        calls = []
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+            calls.append(cmd)
+            out_dir = Path(cmd[cmd.index("-o") + 1])
+            (out_dir / "result").mkdir(parents=True)
+            (out_dir / "result" / "full.md").write_text("# Parsed", encoding="utf-8")
+
+            class Result:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
+
+            return Result()
+
+        with tempfile.TemporaryDirectory() as td, patch("mineru_runner._resolve_executable", return_value=("mineru", "mineru")), patch(
+            "mineru_runner.subprocess.run", fake_run
+        ):
+            source = Path(td) / "paper.pdf"
+            source.write_bytes(b"%PDF")
+            folder = mineru_runner.parse_with_local_cli(source, output_root=Path(td) / "out", backend="pipeline")
+            self.assertEqual((folder / "full.md").read_text(encoding="utf-8"), "# Parsed")
+            self.assertIn("-b", calls[0])
+            self.assertIn("pipeline", calls[0])
+
+    def test_local_cli_missing_executable_has_clear_error(self):
+        with tempfile.TemporaryDirectory() as td, patch("mineru_runner._resolve_executable", return_value=(None, "")):
+            source = Path(td) / "paper.pdf"
+            source.write_bytes(b"%PDF")
+            with self.assertRaisesRegex(mineru_runner.MinerURunnerError, "not found|was not found"):
+                mineru_runner.parse_with_local_cli(source)
+
+    def test_api_file_parse_json_markdown(self):
+        class Response:
+            headers = {"content-type": "application/json"}
+            content = b'{"markdown":"# Parsed"}'
+            text = content.decode("utf-8")
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return json.loads(self.text)
+
+        class Session:
+            def post(self, endpoint, headers=None, files=None, timeout=None):
+                self.endpoint = endpoint
+                self.headers = headers
+                return Response()
+
+        with tempfile.TemporaryDirectory() as td, patch("requests.Session", return_value=Session()):
+            source = Path(td) / "paper.pdf"
+            source.write_bytes(b"%PDF")
+            folder = mineru_runner.parse_with_api(source, "https://mineru.example/api", api_key="secret", output_root=Path(td) / "out")
+            self.assertEqual((folder / "full.md").read_text(encoding="utf-8"), "# Parsed")
+
+
+if __name__ == "__main__":
+    unittest.main()

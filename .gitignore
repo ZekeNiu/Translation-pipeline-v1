@@ -1,6 +1,7 @@
 .env
 *.env
 translations/
+mineru_outputs/
 __pycache__/
 *.py[cod]
 *_cache/
