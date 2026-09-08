@@ -7,3 +7,4 @@
 - Rollback tag successfully created remotely at baseline via GitHub API.
 - Stage 1: per-user DPAPI settings, provider isolation, compact conditional panels, frozen worker input snapshots and queue-delivered errors. Seven targeted tests passed, including real Windows DPAPI round trip.
 - One patch application rejected a delete/add of the same file; split into sequential operations, no partial patch applied.
+- Stage 2: official v4 upload/poll/download, saved part states, lossless page splitting, measured byte limits, chapter hints, seam windows, namespaced assets and conservative merge are implemented. 47 tests pass. Synthetic 199/200/201-page files preserve page dimensions, rotation and text; byte-limit and resume scenarios pass.

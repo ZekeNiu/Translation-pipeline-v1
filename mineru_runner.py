@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import time
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 import zipfile
-from task_state import check_cancel
+from task_state import check_cancel, TaskCancelled, file_hash, fingerprint, read_json, write_json
+from mineru_merge import safe_extract, result_fingerprint, result_valid
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -112,23 +114,54 @@ def parse_with_local_cli(
     if not exe_path:
         raise MinerURunnerError("MinerU CLI was not found. Install MinerU or set the executable path.")
 
-    out_dir = _timestamped_output_dir(source, Path(output_root) if output_root else None)
+    root = Path(output_root) if output_root else DEFAULT_MINERU_OUTPUT_ROOT
+    identity = fingerprint(file_hash(source), str(exe_path), backend) if source.is_file() else None
+    out_dir = root / f"local_{identity[:20]}" if identity else _timestamped_output_dir(source, root)
     out_dir.mkdir(parents=True, exist_ok=True)
+    cache = read_json(out_dir / "local_state.json", {})
+    if result_valid(cache):
+        return locate_mineru_output_folder(cache["result_dir"])
+    result_dir = out_dir / "result"
+    result_dir.mkdir(exist_ok=True)
     if progress:
         progress(f"🔎 MinerU local parse output: {out_dir}")
 
     if command_name == "magic-pdf" or Path(exe_path).name.lower().startswith("magic-pdf"):
-        cmd = [exe_path, "-p", str(source), "-o", str(out_dir)]
+        cmd = [exe_path, "-p", str(source), "-o", str(result_dir)]
     else:
-        cmd = [exe_path, "-p", str(source), "-o", str(out_dir)]
+        cmd = [exe_path, "-p", str(source), "-o", str(result_dir)]
         if backend and backend != "auto":
             cmd.extend(["-b", backend])
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    if cancel_event is None:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    else:
+        with (out_dir / "cli_stdout.txt").open("w", encoding="utf-8") as stdout, (out_dir / "cli_stderr.txt").open("w", encoding="utf-8") as stderr:
+            child = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            started = time.monotonic()
+            try:
+                while child.poll() is None:
+                    if cancel_event.wait(0.2):
+                        check_cancel(cancel_event)
+                    if timeout is not None and time.monotonic() - started > timeout:
+                        raise MinerURunnerError("本地 MinerU 解析超时，已保留文件。")
+            except BaseException:
+                child.terminate()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+                raise
+        proc = subprocess.CompletedProcess(cmd, child.returncode,
+                                           (out_dir / "cli_stdout.txt").read_text(encoding="utf-8", errors="replace"),
+                                           (out_dir / "cli_stderr.txt").read_text(encoding="utf-8", errors="replace"))
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise MinerURunnerError(f"MinerU CLI failed with exit code {proc.returncode}: {detail}")
-    return locate_mineru_output_folder(out_dir)
+    folder = locate_mineru_output_folder(result_dir)
+    write_json(out_dir / "local_state.json", {"result_dir": str(result_dir.resolve()), "result_hashes": result_fingerprint(result_dir)})
+    return folder
 
 
 def _auth_headers(api_key: str | None) -> dict[str, str]:
@@ -136,14 +169,7 @@ def _auth_headers(api_key: str | None) -> dict[str, str]:
 
 
 def _extract_zip(content: bytes, out_dir: Path) -> None:
-    zip_path = out_dir / "mineru_result.zip"
-    zip_path.write_bytes(content)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(out_dir)
-    try:
-        zip_path.unlink()
-    except OSError:
-        pass
+    safe_extract(io.BytesIO(content), out_dir)
 
 
 def _json_get(data: Any, dotted_key: str) -> Any:
@@ -192,10 +218,12 @@ def _result_url_from_json(data: Any) -> str | None:
         data,
         (
             "download_url",
+            "full_zip_url",
             "output_url",
             "result_url",
             "url",
             "data.download_url",
+            "data.full_zip_url",
             "data.output_url",
             "data.result_url",
             "data.url",
@@ -227,6 +255,8 @@ def _handle_api_response(resp, out_dir: Path, session, base_url: str, api_key: s
     try:
         data = resp.json()
     except ValueError:
+        if "html" in content_type or resp.text.lstrip().lower().startswith(("<!doctype html", "<html")):
+            raise MinerURunnerError("MinerU API 返回了网页，需填写 API 服务地址。")
         if resp.text.strip():
             (out_dir / "full.md").write_text(resp.text, encoding="utf-8")
             return
@@ -237,7 +267,8 @@ def _handle_api_response(resp, out_dir: Path, session, base_url: str, api_key: s
     result_url = _result_url_from_json(data)
     if result_url:
         download_url = result_url if result_url.startswith(("http://", "https://")) else urljoin(base_url.rstrip("/") + "/", result_url.lstrip("/"))
-        download = session.get(download_url, headers=_auth_headers(api_key), timeout=180)
+        same_origin = (urlsplit(download_url).scheme, urlsplit(download_url).netloc) == (urlsplit(base_url).scheme, urlsplit(base_url).netloc)
+        download = session.get(download_url, headers=_auth_headers(api_key) if same_origin else {}, timeout=180)
         download.raise_for_status()
         _handle_api_response(download, out_dir, session, base_url, api_key)
         return
@@ -262,6 +293,11 @@ def parse_with_api(
         raise FileNotFoundError(f"Input file does not exist: {source}")
     if not base_url.strip():
         raise MinerURunnerError("MinerU API Base URL is empty.")
+    if mode == "official" or (mode == "auto" and urlsplit(base_url).hostname in {"mineru.net", "www.mineru.net"}):
+        from mineru_cloud import parse_official
+        return parse_official(input_path, base_url, api_key, output_root or DEFAULT_MINERU_OUTPUT_ROOT,
+                              timeout=timeout, poll_interval=poll_interval, max_wait=max_wait,
+                              progress=progress, cancel_event=cancel_event)
 
     import requests
 
@@ -300,6 +336,7 @@ def parse_with_api(
 
             deadline = time.time() + max_wait
             while time.time() < deadline:
+                check_cancel(cancel_event)
                 status_resp = session.get(f"{base}/tasks/{task_id}", headers=_auth_headers(api_key), timeout=timeout)
                 status_resp.raise_for_status()
                 status_data = status_resp.json()
@@ -313,8 +350,9 @@ def parse_with_api(
                     raise MinerURunnerError(f"MinerU API task failed: {json.dumps(status_data, ensure_ascii=False)[:600]}")
                 time.sleep(poll_interval)
             raise MinerURunnerError(f"MinerU API task timed out after {max_wait} seconds.")
+        except TaskCancelled:
+            raise
         except Exception as exc:
             last_error = exc
-            if mode != "auto":
-                break
+            break  # Only an explicit 404/405 above is evidence for another protocol.
     raise MinerURunnerError(f"MinerU API parse failed: {last_error}")
