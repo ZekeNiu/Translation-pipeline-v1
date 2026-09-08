@@ -9,6 +9,7 @@ import time
 from typing import Any
 from urllib.parse import urljoin
 import zipfile
+from task_state import check_cancel
 
 
 PROJECT_ROOT = Path(__file__).parent
@@ -98,7 +99,9 @@ def parse_with_local_cli(
     backend: str | None = None,
     timeout: int | None = None,
     progress=None,
+    cancel_event=None,
 ) -> Path:
+    check_cancel(cancel_event)
     source = Path(input_path)
     if not source.exists():
         raise FileNotFoundError(f"Input file does not exist: {source}")
@@ -251,7 +254,9 @@ def parse_with_api(
     poll_interval: int = 3,
     max_wait: int = 1800,
     progress=None,
+    cancel_event=None,
 ) -> Path:
+    check_cancel(cancel_event)
     source = Path(input_path)
     if not source.exists():
         raise FileNotFoundError(f"Input file does not exist: {source}")

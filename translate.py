@@ -19,6 +19,7 @@ import time
 from inline_semantics import find_inline_artifacts, normalize_inline_output, protect_inline_semantics
 from mineru_sidecar import load_mineru_sidecar, strip_excluded_lines, write_sidecar_summary
 from table_utils import html_table_blocks, iter_cells, parse_html_tables, render_html_table
+from task_state import check_cancel
 
 
 # -- Config -----------------------------------------------------------
@@ -926,7 +927,10 @@ def run(
     timeout=None,
     speed_mode=None,
     max_workers=None,
+    cancel_event=None,
+    parse_seconds=0,
 ):
+    check_cancel(cancel_event)
     config = resolve_provider_config(
         provider=provider,
         base_url=base_url,
@@ -1029,6 +1033,7 @@ def run(
 
     if workers == 1:
         for i, seg in enumerate(segments):
+            check_cancel(cancel_event)
             progress(f"🌐 [{i + 1}/{len(segments)}]", segment=i + 1, total=len(segments))
             translated = translate_segment(
                 seg,
@@ -1063,6 +1068,7 @@ def run(
             }
             completed = 0
             for future in concurrent.futures.as_completed(future_map):
+                check_cancel(cancel_event)
                 i = future_map[future]
                 translated = future.result()
                 translations[i] = translated
