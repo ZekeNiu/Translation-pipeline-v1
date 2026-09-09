@@ -7,3 +7,6 @@
 - Official API: POST /api/v4/file-urls/batch (max 50); PUT signed URLs; GET /api/v4/extract-results/batch/{batch_id}; result full_zip_url. Upload URLs expire after 24h. Token must not reach object storage.
 - Reuse ideas, independently implemented: deusyu/translate-book (manifest and neighbor context), KazKozDev/book-translator (localized verified corrections). Keep MinerU Markdown primary.
 - GitHub main confirmed at baseline via API. Git transport had one connection reset during planning; authentication available.
+- Live sample found a numeric-check bug: Python Unicode word boundaries skipped digits adjacent to Chinese text. ASCII letter/digit boundaries now correctly match “为45秒” and “表1”.
+- Revisions operate only on paragraphs with identified concerns and preserve the other already-validated paragraphs. Retry timing is recorded separately without reducing checks or enabling extra concurrency.
+- DOCX visual inspection confirmed merged headers, formulas, images and references followed by translated discussion/appendix. MinerU OCR quality still requires a configured token and representative real books.

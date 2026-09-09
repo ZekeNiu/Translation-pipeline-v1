@@ -7,6 +7,7 @@ from pathlib import Path
 
 from inline_semantics import iter_styled_runs, normalize_inline_output
 from table_utils import parse_html_tables
+from document_blocks import REFERENCE
 
 try:
     from docx import Document
@@ -31,10 +32,6 @@ CITATION_SIZE = 8
 TABLE_SIZE = 8.5
 CITE_RE = re.compile(r"(\[\d+(?:[,\s\u2013–-]+\d+)*\])")
 XML_BAD_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-REFERENCE_HEADING_TEXT_RE = re.compile(
-    r"^(references|bibliography|works\s+cited|literature\s+cited|参考文献|參考文獻)$",
-    re.IGNORECASE,
-)
 
 
 def set_font(run, bold=False, italic=False, size=None):
@@ -86,7 +83,7 @@ def _paragraph(doc, text: str, size=BODY_SIZE, first_indent=True, italic=False, 
 
 
 def _is_reference_heading(text: str) -> bool:
-    return bool(REFERENCE_HEADING_TEXT_RE.fullmatch(text.strip()))
+    return bool(REFERENCE.fullmatch(text.strip()))
 
 
 def _reference_paragraph(doc, text: str):
@@ -115,34 +112,36 @@ def _add_html_table(doc, html: str) -> bool:
         rows = [row for row in parsed.rows if row.cells]
         if not rows:
             continue
-        max_cols = max(sum(_safe_int(cell.attrs.get("colspan"), 1) for cell in row.cells) for row in rows)
+        occupied, placements, max_cols = set(), [], 0
+        for row_idx, parsed_row in enumerate(rows):
+            col_idx = 0
+            for parsed_cell in parsed_row.cells:
+                colspan = _safe_int(parsed_cell.attrs.get("colspan"), 1)
+                rowspan = min(_safe_int(parsed_cell.attrs.get("rowspan"), 1), len(rows) - row_idx)
+                while any((row_idx, col_idx + delta) in occupied for delta in range(colspan)):
+                    col_idx += 1
+                placements.append((row_idx, col_idx, rowspan, colspan, parsed_cell))
+                for r in range(row_idx, row_idx + rowspan):
+                    for c in range(col_idx, col_idx + colspan):
+                        occupied.add((r, c))
+                max_cols = max(max_cols, col_idx + colspan)
+                col_idx += colspan
         table = doc.add_table(rows=len(rows), cols=max_cols)
         try:
             table.style = "Table Grid"
         except Exception:
             pass
 
-        for row_idx, parsed_row in enumerate(rows):
-            col_idx = 0
-            for parsed_cell in parsed_row.cells:
-                if col_idx >= max_cols:
-                    break
-                colspan = _safe_int(parsed_cell.attrs.get("colspan"), 1)
-                cell = table.cell(row_idx, col_idx)
-                if colspan > 1 and col_idx + colspan - 1 < max_cols:
-                    cell = cell.merge(table.cell(row_idx, col_idx + colspan - 1))
-                cell.text = ""
-                paragraph = cell.paragraphs[0]
-                paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
-                paragraph.paragraph_format.line_spacing = 1.0
-                paragraph.paragraph_format.space_after = Pt(0)
-                _add_text_runs(
-                    paragraph,
-                    parsed_cell.text,
-                    size=TABLE_SIZE,
-                    bold=(parsed_cell.tag == "th"),
-                )
-                col_idx += colspan
+        for row_idx, col_idx, rowspan, colspan, parsed_cell in placements:
+            cell = table.cell(row_idx, col_idx)
+            if colspan > 1 or rowspan > 1:
+                cell = cell.merge(table.cell(row_idx + rowspan - 1, col_idx + colspan - 1))
+            cell.text = ""
+            paragraph = cell.paragraphs[0]
+            paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+            paragraph.paragraph_format.line_spacing = 1.0
+            paragraph.paragraph_format.space_after = Pt(0)
+            _add_text_runs(paragraph, parsed_cell.text, size=TABLE_SIZE, bold=(parsed_cell.tag == "th"))
         doc.add_paragraph()
     return True
 
@@ -160,7 +159,7 @@ def _image_candidates(rel_path: str, images_search_root: Path):
 def _add_image(doc, image_line: str, images_search_root: Path | None):
     m = re.match(r"!\[[^\]]*\]\(([^)]+)\)", image_line)
     if not (m and images_search_root):
-        return
+        return "图片路径无法识别。"
     rel_path = m.group(1)
     for ip in _image_candidates(rel_path, images_search_root):
         ip = ip.resolve()
@@ -171,8 +170,9 @@ def _add_image(doc, image_line: str, images_search_root: Path | None):
                 r = p.add_run()
                 r.add_picture(str(ip), width=Inches(4.8))
             except Exception:
-                pass
-            return
+                return f"Word 无法嵌入图片：{rel_path}"
+            return None
+    return f"Word 找不到图片：{rel_path}"
 
 
 def _configure_document(doc):
@@ -209,7 +209,8 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
 
     lines = md_text.splitlines()
     i = 0
-    reference_mode = False
+    reference_level = None
+    warnings = []
     while i < len(lines):
         line = lines[i]
         s = line.strip()
@@ -226,23 +227,37 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
                 i += 1
                 continue
 
-        if s.startswith("!["):
-            _add_image(doc, s, root)
+        images = list(re.finditer(r"!\[[^\]]*\]\([^)]+\)", s))
+        if images:
+            position = 0
+            for image in images:
+                before = s[position:image.start()].strip()
+                if before:
+                    _paragraph(doc, before)
+                warning = _add_image(doc, image[0], root)
+                if warning:
+                    warnings.append(warning)
+                position = image.end()
+            if s[position:].strip():
+                _paragraph(doc, s[position:].strip())
             i += 1
             continue
 
-        hm = re.match(r"^(#{1,4})\s+(.+)$", line)
+        hm = re.match(r"^(#{1,6})\s+(.+)$", line)
         if hm:
             lv = len(hm.group(1))
             text = hm.group(2).strip()
             p = doc.add_heading(text, level=lv)
             for r in p.runs:
                 set_font(r, bold=True)
-            reference_mode = _is_reference_heading(text)
+            if _is_reference_heading(text):
+                reference_level = lv
+            elif reference_level is not None and lv <= reference_level:
+                reference_level = None
             i += 1
             continue
 
-        if reference_mode:
+        if reference_level is not None:
             _reference_paragraph(doc, s)
             i += 1
             continue
@@ -264,6 +279,7 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
 
     doc.save(str(docx_path))
     print(f"Wrote {docx_path}")
+    return warnings
 
 
 if __name__ == "__main__":

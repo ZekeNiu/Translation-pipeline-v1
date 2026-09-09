@@ -173,6 +173,7 @@ class App:
         self.cli_frame.grid() if mode == SOURCE_LOCAL_CLI else self.cli_frame.grid_remove()
         if save:
             self._save_settings()
+            self._toggle_panels()
 
     def _toggle_panels(self):
         self.advanced_frame.grid() if self.advanced_var.get() else self.advanced_frame.grid_remove()

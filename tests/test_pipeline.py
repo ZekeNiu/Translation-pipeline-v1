@@ -15,6 +15,18 @@ from translate import ProviderConfig
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_inline_images_preserve_surrounding_text_in_docx(self):
+        import base64
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'figure.png').write_bytes(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII='))
+            path = root / 'inline.docx'
+            warnings = make_docx('Before ![](figure.png) between ![](figure.png) after.', path, root)
+            doc = Document(path)
+            self.assertEqual(warnings, [])
+            self.assertEqual(len(doc.inline_shapes), 2)
+            self.assertEqual([p.text for p in doc.paragraphs if p.text], ['Before', 'between', 'after.'])
+
     def test_scientific_comparators_are_not_stripped(self):
         text = "HIT includes short (<45 s) to long (>2 min) intervals."
         self.assertEqual(translate.normalize_source_text(text), text)
@@ -80,6 +92,24 @@ class PipelineQualityTests(unittest.TestCase):
             doc = Document(str(out))
             self.assertEqual(len(doc.tables), 1)
             self.assertEqual(doc.tables[0].cell(1, 1).text, "<45 s")
+
+    def test_docx_preserves_rowspan_and_colspan(self):
+        html = '<table><tr><th rowspan="2">Group</th><th colspan="2">Measures</th></tr><tr><td>12</td><td>24</td></tr></table>'
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / 'spans.docx'
+            make_docx(html, out)
+            table = Document(out).tables[0]
+            self.assertEqual(table.cell(0, 0)._tc, table.cell(1, 0)._tc)
+            self.assertEqual(table.cell(0, 1)._tc, table.cell(0, 2)._tc)
+            self.assertEqual(table.cell(1, 1).text, '12')
+            self.assertEqual(table.cell(1, 2).text, '24')
+
+    def test_docx_reports_unrenderable_image(self):
+        with tempfile.TemporaryDirectory() as td:
+            image = Path(td) / 'invalid.png'
+            image.write_bytes(b'invalid')
+            warnings = make_docx('![](invalid.png)', Path(td) / 'invalid.docx', Path(td))
+            self.assertTrue(warnings)
 
     def test_latex_readable_normalizer_handles_mineru_formula(self):
         source = r"$[ \mathrm { v / p } \dot { V } \mathrm { O } _ { 2 \operatorname* { m a x } } ]$"

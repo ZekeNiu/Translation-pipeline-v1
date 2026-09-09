@@ -1,61 +1,27 @@
-# Long Book Translation Roadmap
+# 实现范围与后续取舍
 
-This document tracks the path from the current MinerU Markdown translator to a robust long-book translation system.
+本轮以英文论文、专业书籍的完整性和可恢复性为主，保留桌面界面、MinerU 与 Markdown / DOCX 输出。
 
-## Goals
+## 已实现
 
-- Translate academic papers and long books with high translation quality.
-- Preserve document structure, tables, formulas, figures, captions, footnotes, and references as much as practical.
-- Keep the workflow simple for non-technical users.
-- Make long jobs resumable, auditable, and predictable in cost and time.
+- Windows 用户配置与 DPAPI Key 保存；厂商设置互不覆盖；输入模式按需显示，日志和高级设置折叠。
+- 官网 v4 协议、按实际页数和体积分片、章节边界优先、接缝补充解析、分片状态恢复和同名图片隔离。
+- 正文结构块、完整 HTML 表格、原位置参考文献、相邻原文上下文、段落与占位符校验。
+- 只修订有疑点的段落 / 单元格；合格结果不会因修订失败被替换。
+- 来源及配置指纹、结果哈希、原子保存、停止并继续、完成 / 待检查 / 部分失败三种状态。
+- 分阶段耗时和重试请求耗时、连接复用、已校验请求缓存和同文档表格文本复用。默认保持两路并发。
 
-## Non-goals
+模块按职责分开：`settings_store.py` 保存设置；`pdf_parts.py` 分片；`mineru_cloud.py` 管理官网任务；`mineru_merge.py` 合并结果；`document_blocks.py` 与 `translation_checks.py` 定义结构和检查；`translation_job.py` 编排续跑。`mineru_runner.py` 和 `translate.py` 保留返回目录 / 输出路径的接口。
 
-- Do not reproduce PDF headers, footers, copyright lines, or running titles by default.
-- Do not force automatically extracted English terms to remain English.
-- Do not use cross-document translation memory by default, because stale terms from older projects can pollute new books.
-- Do not depend on one fixed MinerU JSON schema as the only source of truth.
+## 借鉴依据
 
-## Phase 1: Structure Stability
+- [deusyu/translate-book](https://github.com/deusyu/translate-book)：借鉴来源指纹、分段检查、断点恢复和短原文上下文的思路。
+- [KazKozDev/book-translator](https://github.com/KazKozDev/book-translator)：借鉴只修订具体问题、保留合格结果的思路。
 
-- Keep MinerU Markdown as the primary source, with JSON sidecars used only as structural assistance.
-- Build a shared inline semantic layer for body text, tables, captions, headings, and notes.
-- Classify inline content as ordinary text, pure math, formula terms, script markers, citations, or simple HTML formatting before translation.
-- Ensure ordinary source language is translated unless it is clearly a formula, citation, unit, acronym, name, or reference-list entry.
-- Add quality checks for untranslated English, broken formulas, missing images, failed tables, and leaked HTML tags.
+实现独立编写，未复制这两个项目的源码或引入其多模型工作流；并未把项目知名度视为翻译质量证据。
 
-## Phase 2: Long-document Task System
+## 后续取舍
 
-- Split books by chapter and section instead of only by character count.
-- Store each chapter as an independent task with durable status, cache keys, retry count, timings, and provider metadata.
-- Support pause, resume, retry failed chapter, and regenerate selected chapter.
-- Estimate token usage, cost, and runtime before starting large jobs.
-- Keep chunk prompts light; do not repeat long glossary or entity lists in every request.
+本轮不增加全书二次审校、自动 Office 转换、新导出格式或复杂任务管理页面。后续应先用真实长书积累接缝与翻译质量样本，再决定是否需要人工术语表、定向重新翻译和额外格式支持。
 
-## Phase 3: Consistency System
-
-- Use document-local translation memory for exact repeated titles, captions, table cells, and short repeated sentences.
-- Extract terminology candidates for audit first, not as forced prompt constraints.
-- Allow optional user-provided glossary import when the user has authoritative terms.
-- Generate a terminology consistency report showing source term, observed translations, locations, and suspected conflicts.
-- Protect acronyms by general pattern rules, not by document-specific hardcoded lists.
-
-## Phase 4: Quality Audit
-
-- Report untranslated ordinary English in body text, headings, captions, and tables.
-- Report formula artifacts such as raw `\mathrm`, damaged delimiters, or suspicious placeholder leakage.
-- Report table cells that failed translation, lost rowspan/colspan, or contain residual HTML.
-- Report missing figures, untranslated captions, and reference-list translation mistakes.
-- Produce a per-chapter audit summary so long books can be reviewed incrementally.
-
-## Phase 5: Output Formats and MinerU Integration
-
-- Improve DOCX fidelity for tables, footnotes, formulas, images, captions, and bilingual layouts.
-- Add optional bilingual DOCX, Markdown, HTML, and EPUB outputs.
-- Integrate MinerU local deployment or MinerU API from the GUI.
-- Let users run PDF-to-translation from one workflow while still exposing intermediate files for debugging.
-- Keep provider/model selection editable and avoid hardcoding live model lists.
-
-## Acceptance Direction
-
-A future long-book-ready version should be able to translate by chapter, resume after interruption, reuse document-local memory, produce a quality report, and regenerate only the problematic parts without rerunning the whole book.
+接缝修复采用保守映射，无法确认的 OCR 差异保留并报告。扫描内容的实际识别质量仍取决于解析服务。Word 保留阅读结构，不复刻原始 PDF 版面。详见[验收记录](validation-and-rollback.md)。

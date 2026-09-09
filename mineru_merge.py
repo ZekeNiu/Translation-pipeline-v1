@@ -9,6 +9,7 @@ import stat
 import zipfile
 
 from task_state import atomic_write, file_hash, read_json, write_json
+from table_utils import parse_html_tables
 
 
 def safe_extract(archive, directory: Path):
@@ -144,10 +145,12 @@ def _signature(text, root):
         if not path.is_relative_to(root.resolve()) or not path.is_file():
             return match[0]
         return "IMAGE:" + file_hash(path)
+    rows = [tuple((cell.tag, cell.attrs.get("rowspan", "1"), cell.attrs.get("colspan", "1"), re.sub(r"\s+", "", cell.text))
+                  for cell in row.cells) for table in parse_html_tables(text) for row in table.rows]
     text = re.sub(r"!\[[^\]]*\]\(([^)]+)\)", image_token, text)
     text = re.sub(r"</?(?:table|thead|tbody|tr|td|th|html|body)\b[^>]*>", " ", text, flags=re.I)
     text = re.sub(r"(?m)^#{1,6}\s+", "", text)
-    return re.sub(r"\s+", "", html.unescape(text))
+    return re.sub(r"\s+", "", html.unescape(text)), rows
 
 
 def merge_parts(parts, output: Path, warnings=None):

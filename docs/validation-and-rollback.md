@@ -1,0 +1,45 @@
+# 验收与回退
+
+验收日期：2026-09-09。基线：`000116058b053f3016dfb57388b4aa34c1d360a2`。
+
+## 验证结果
+
+本机 Windows / Python 3.14：80 项回归测试通过。覆盖以下可重复验证的行为：
+
+- 真实 DPAPI 加解密；保存失败保留旧文件；重开界面恢复模式、URL 和清空后的 Key；各厂商独立设置；后台错误和任务配置快照。
+- 199 / 200 / 201 页边界、章节书签、落盘字节阈值、单页超限、扫描图像字节保留、页码覆盖、旋转 / 尺寸保留、加密与损坏 PDF。体积测试使用缩小的测试阈值触发同一生产分片算法，没有上传实际 200MB 文件。
+- 官网协议模拟：上传 / 查询 / 下载、50 文件批次上限、部分失败仅补缺、停止后查询原任务、损坏结果重取、过期对象存储链接、限流、超时、鉴权失败不盲重试；确认对象存储请求不携带 API Token。
+- 同名图片、缺失 / 重叠页码、可唯一映射的接缝修复、不确定接缝保留、禁止借修复改变表格单元格对应关系。
+- 长 HTML 表格与公式不截断、参考文献后续章节保留、空译文 / 截断 / 标记缺失与乱序拒收、只修订疑点段落、失败单元格不缓存成功、缓存损坏和配置变化、停止后继续。
+- Word 合并单元格、内嵌图片前后文字保留、图片导出失败报告。
+
+已配置 GitHub Actions，在 Windows 的 Python 3.11 / 3.14 上运行相同回归测试；具体运行状态以[仓库 Actions](https://github.com/ZekeNiu/Translation-pipeline-v1/actions/workflows/tests.yml)为准。
+
+## 真实小样本与视觉检查
+
+使用 `tests/manual_smoke.py` 自行生成学术样例：方法、数值、上下标公式、合并表头、图与图注、参考文献、讨论和附录。没有上传用户私人文档。
+
+已有 DeepSeek 配置完成真实翻译：共 3 次模型请求，约 81.4 秒，其中一次是数字检查误把中文紧邻数字视为变化而触发的额外修订。问题已修复并增加回归测试。随后禁止新模型调用、复用并重新检查已保存的真实响应，结果为 `completed`，0 次新增请求，无剩余检查项。耗时只是这一小样本的观测，不能代表长书速度。
+
+已逐段对照样例译文，数值、公式、表格、参考文献原位置、后续讨论和附录均保留；“观察差异不能确立因果关系”等语义保持。通过本机 Word 打开生成的 DOCX、导出 PDF 并查看页面，确认合并表格、图片图注、上下标和正文布局正常。默认文档渲染器缺少 LibreOffice，故采用 Word + Poppler 验证。GUI 的 MinerU API 常用视图也已截图检查。
+
+当前环境没有 MinerU 官网 Key，因此官网端到端真实上传、实际 OCR 质量与真实超限长书仍未实测。上述协议与拆分测试不能替代这些实测。学术翻译的细节准确性仍需使用者结合原文审阅。
+
+## 回退
+
+实施前的基线已建立远端标签：[`rollback/pre-mineru-improvements-20260908`](https://github.com/ZekeNiu/Translation-pipeline-v1/tree/rollback/pre-mineru-improvements-20260908)。只想试回原版本时，先提交或另存自己的改动，再运行：
+
+```powershell
+git fetch origin --tags
+git switch --detach rollback/pre-mineru-improvements-20260908
+```
+
+回到发布版本：`git switch main`。切换代码不会删除 `translations/`、`mineru_outputs/` 或用户配置；保留这些目录便于恢复进度。
+
+改动在 `codex/mineru-quality-reliability` 分支分阶段提交：
+
+1. `2d27364`：配置保存与界面。
+2. `39b8f57`：官网解析与 PDF 拆分。
+3. `Preserve document structure and resume validated translations`：质量与续跑，包含验收发现的解析和界面补充修正。
+
+若希望在 `main` 撤销某项改动且保留历史，可查看 `git log --oneline`，使用 `git revert <提交号>` 创建撤销提交，再 `git push origin main`。阶段之间存在依赖；撤销全部功能时按最新功能提交、`39b8f57`、`2d27364` 的顺序逐个撤销，并运行测试。避免只撤销底层配置或解析模块而保留依赖它的代码。

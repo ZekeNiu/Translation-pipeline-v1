@@ -10,7 +10,7 @@ echo.
 REM Check Python
 where python >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    echo ❌ 未找到 Python！请安装 Python 3.8+
+    echo ❌ 未找到 Python！请安装 Python 3.11+
     pause
     exit /b 1
 )
@@ -23,7 +23,7 @@ if not exist "%~dp0.env" (
 )
 
 REM Get folder path
-set FOLDER=%1
+set "FOLDER=%~1"
 if "%FOLDER%"=="" (
     echo 用法：
     echo   1) 拖拽 MinerU 文件夹到此 .bat 文件上
@@ -32,14 +32,14 @@ if "%FOLDER%"=="" (
     set /p FOLDER="📂 请输入 MinerU 文件夹路径: "
 )
 
-echo 📂 输入: %FOLDER%
+echo 📂 输入: "%FOLDER%"
 echo.
 
 python "%~dp0translate.py" "%FOLDER%"
 
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo ❌ 翻译失败。可能的原因：
+    echo ❌ 任务未完全完成，请查看上方错误或结果目录中的质量报告。可能的原因：
     echo   - .env 中的 API Key 无效
     echo   - 文件夹路径不正确
     echo   - 网络连接问题

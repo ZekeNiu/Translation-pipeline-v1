@@ -8,7 +8,7 @@ from unittest.mock import patch
 import zipfile
 
 from mineru_cloud import parse_official
-from mineru_merge import merge_parts, result_fingerprint, safe_extract
+from mineru_merge import merge_parts, result_fingerprint, safe_extract, _signature
 from http_client import RemoteError, request
 from task_state import TaskCancelled, file_hash, read_json, write_json
 from pdf_parts import prepare_parts
@@ -66,6 +66,35 @@ class Cloud:
 
 
 class CloudTests(unittest.TestCase):
+    def test_expired_storage_links_refresh_without_reparsing_done_parts(self):
+        for expired_method in ('PUT', 'GET'):
+            with self.subTest(method=expired_method), tempfile.TemporaryDirectory() as td:
+                source = make_pdf(Path(td) / 'source.pdf', 1)
+                cloud = Cloud()
+                original_request, expired = cloud.request, []
+                def simulated_request(method, url, **kwargs):
+                    if method == expired_method and '/api/v4/' not in url and not expired:
+                        expired.append(url)
+                        response = Response()
+                        response.status_code = 403
+                        return response
+                    return original_request(method, url, **kwargs)
+                cloud.request = simulated_request
+                with patch('mineru_cloud.requests.Session', return_value=cloud):
+                    output = parse_official(source, 'https://mineru.net', 'dummy-secret', Path(td) / 'out', poll_interval=0)
+                self.assertTrue((output / 'full.md').exists())
+                self.assertEqual(len(cloud.batches), 2 if expired_method == 'PUT' else 1)
+                self.assertEqual(cloud.uploads, ['part_0001'])
+
+    def test_batches_never_exceed_fifty_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = make_pdf(Path(td) / 'source.pdf', 51, bookmarks=list(range(1, 51)))
+            cloud = Cloud()
+            split = lambda source, directory, **kw: prepare_parts(source, directory, max_pages=1, **kw)
+            with patch('mineru_cloud.requests.Session', return_value=cloud), patch('mineru_cloud.prepare_parts', side_effect=split):
+                parse_official(source, 'https://mineru.net', 'dummy-secret', Path(td) / 'out', poll_interval=0)
+            self.assertEqual(sorted(len(batch) for batch in cloud.batches.values()), [1, 50])
+
     def test_official_upload_and_restart_make_no_duplicate_requests(self):
         with tempfile.TemporaryDirectory() as td:
             source = make_pdf(Path(td) / 'source.pdf', 2)
@@ -122,6 +151,39 @@ class CloudTests(unittest.TestCase):
 
 
 class MergeTests(unittest.TestCase):
+    def test_unambiguous_seam_joins_paragraph_without_losing_text(self):
+        with tempfile.TemporaryDirectory() as td:
+            parts = []
+            for name, start, end, kind, text in (
+                ('p1', 0, 1, 'main', 'A paragraph begins'),
+                ('p2', 1, 2, 'main', 'and ends here.'),
+                ('seam', 0, 2, 'seam', 'A paragraph begins and ends here.'),
+            ):
+                raw = Path(td) / name
+                raw.mkdir()
+                (raw / 'full.md').write_text(text, encoding='utf-8')
+                write_json(raw / 'doc_content_list.json', [{'type': 'text', 'text': text, 'page_idx': 0}])
+                parts.append(dict(id=name, start=start, end=end, kind=kind, sha256=name,
+                                  result_dir=str(raw), result_hashes=result_fingerprint(raw)))
+            output = merge_parts(parts, Path(td) / 'merged')
+            self.assertEqual((output / 'full.md').read_text().strip(), 'A paragraph begins and ends here.')
+            self.assertEqual(read_json(output / 'parse_report.json')['seams'][0]['status'], 'verified')
+
+    def test_seam_cannot_move_text_between_table_cells(self):
+        first = '<table><tr><td>AB</td><td>C</td></tr></table>'
+        altered = '<table><tr><td>A</td><td>BC</td></tr></table>'
+        self.assertNotEqual(_signature(first, Path('.')), _signature(altered, Path('.')))
+
+    def test_missing_or_overlapping_pages_stop_merge(self):
+        for start in (0, 2):
+            with self.subTest(start=start), tempfile.TemporaryDirectory() as td:
+                raw = Path(td) / 'raw'
+                raw.mkdir()
+                (raw / 'full.md').write_text('Text.')
+                part = dict(id='p1', start=0, end=1, kind='main', sha256='x', result_dir=str(raw), result_hashes=result_fingerprint(raw))
+                with self.assertRaisesRegex(ValueError, '页码覆盖'):
+                    merge_parts([part, {**part, 'id': 'p2', 'start': start, 'end': start+1}], Path(td) / 'merged')
+
     def test_archive_traversal_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             data = io.BytesIO()
@@ -164,6 +226,22 @@ class MergeTests(unittest.TestCase):
 
 
 class HttpTests(unittest.TestCase):
+    def test_timeout_retries_rewind_upload_stream(self):
+        import requests
+        from unittest.mock import Mock
+        stream, positions = io.BytesIO(b'complete file'), []
+        def upload(*args, **kwargs):
+            positions.append(kwargs['data'].tell())
+            kwargs['data'].read()
+            if len(positions) == 1:
+                raise requests.Timeout()
+            return Response()
+        session = Mock()
+        session.request.side_effect = upload
+        with patch('http_client.interruptible_wait'):
+            request(session, 'PUT', 'https://storage.invalid', data=stream)
+        self.assertEqual(positions, [0, 0])
+
     def test_auth_failure_is_not_retried(self):
         response = Response()
         response.status_code = 401

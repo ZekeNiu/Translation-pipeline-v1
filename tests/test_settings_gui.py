@@ -59,6 +59,30 @@ class GuiTests(unittest.TestCase):
         with patch.dict(os.environ, {"AI_PROVIDER": "custom", "AI_API_KEY": "", "MINERU_API_KEY": ""}):
             self.app = App(self.root, SettingsStore(Path(self.tmp.name) / "settings.json"))
 
+    @unittest.skipUnless(os.name == "nt", "DPAPI requires Windows")
+    def test_reopened_gui_restores_api_mode_and_cleared_key(self):
+        import tkinter as tk
+        from gui import App, SOURCE_API, SOURCE_EXISTING_FOLDER
+        self.app.vars['source_mode'].set(SOURCE_API)
+        self.app.vars['mineru_url'].set('https://mineru.net')
+        self.app.vars['mineru_key'].set('test-mineru-key')
+        self.app._save_settings()
+        self.app.vars['source_mode'].set(SOURCE_EXISTING_FOLDER)
+        self.app._update_source_mode()
+        self.app.vars['source_mode'].set(SOURCE_API)
+        self.app.vars['mineru_key'].set('')
+        self.app._save_settings()
+        window = tk.Toplevel(self.root)
+        window.withdraw()
+        restored = App(window, self.app.store)
+        try:
+            self.assertEqual(restored.vars['source_mode'].get(), SOURCE_API)
+            self.assertEqual(restored.vars['mineru_url'].get(), 'https://mineru.net')
+            self.assertEqual(restored.vars['mineru_key'].get(), '')
+        finally:
+            window.after_cancel(restored.queue_timer)
+            window.destroy()
+
     def test_provider_switch_restores_independent_settings(self):
         self.app.vars["base_url"].set("https://example.invalid/v1")
         self.app.vars["model"].set("custom-model")

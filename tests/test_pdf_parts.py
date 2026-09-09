@@ -40,6 +40,24 @@ class PdfPartsTests(unittest.TestCase):
             parts, _, _ = prepare_parts(source, Path(td) / 'parts', max_pages=5)
             seam = next(p for p in parts if p.kind == 'seam')
             self.assertEqual((seam.start, seam.end), (3, 7))
+            original = PdfReader(source)
+            for part in parts:
+                for i, page in enumerate(PdfReader(part.path).pages):
+                    expected = original.pages[part.start + i]
+                    self.assertEqual(page['/Resources']['/XObject']['/Im1'].get_data(), expected['/Resources']['/XObject']['/Im1'].get_data())
+                    self.assertFalse(page.extract_text())
+
+    def test_password_protected_pdf_is_rejected_before_upload(self):
+        from pypdf import PdfWriter
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'encrypted.pdf'
+            writer = PdfWriter()
+            writer.add_blank_page(612, 792)
+            writer.encrypt('required-password')
+            writer.write(path)
+            writer.close()
+            with self.assertRaisesRegex(ValueError, '损坏或加密'):
+                prepare_parts(path, Path(td) / 'parts')
 
     def test_measured_size_forces_smaller_parts(self):
         with tempfile.TemporaryDirectory() as td:

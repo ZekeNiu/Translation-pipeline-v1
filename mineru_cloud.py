@@ -100,6 +100,7 @@ def parse_official(input_path, base_url, api_key, output_root, *, timeout=180, p
         state["status"] = "running"
         write_json(manifest, state)
         deadline = time.monotonic() + max_wait
+        refreshed_uploads, refreshed_downloads = set(), set()
         while any(p["status"] not in {"done", "failed"} for p in parts):
             check_cancel(cancel_event)
             if time.monotonic() >= deadline:
@@ -134,7 +135,14 @@ def parse_official(input_path, base_url, api_key, output_root, *, timeout=180, p
                         url = item.get("full_zip_url")
                         if not url:
                             raise RemoteError("MinerU 完成任务缺少下载地址。")
-                        result = _download(session, url, directory / "raw" / part["id"], cancel_event, timeout)
+                        try:
+                            result = _download(session, url, directory / "raw" / part["id"], cancel_event, timeout)
+                        except RemoteError as exc:
+                            if exc.status in {401, 403, 404} and part["id"] not in refreshed_downloads:
+                                # Requery the completed task once for a fresh signed link.
+                                refreshed_downloads.add(part["id"])
+                                continue
+                            raise
                         part.update(result_dir=str(result.resolve()), result_hashes=result_fingerprint(result), status="done")
                         part.pop("upload_url", None)
                     elif status == "failed":
@@ -147,11 +155,21 @@ def parse_official(input_path, base_url, api_key, output_root, *, timeout=180, p
                         else:
                             if time.time() - part.get("uploaded_at", 0) < 60:
                                 continue
-                            with Path(part["path"]).open("rb") as fh:
-                                # Signed object storage requests intentionally carry no API headers.
-                                response = request(session, "PUT", part["upload_url"], data=fh, timeout=timeout, cancel_event=cancel_event)
-                                response.close()
-                            part.update(status="uploaded", uploaded_at=time.time())
+                            try:
+                                with Path(part["path"]).open("rb") as fh:
+                                    # Signed object storage requests intentionally carry no API headers.
+                                    response = request(session, "PUT", part["upload_url"], data=fh, timeout=timeout, cancel_event=cancel_event)
+                                    response.close()
+                                part.update(status="uploaded", uploaded_at=time.time())
+                            except RemoteError as exc:
+                                if exc.status not in {401, 403, 404} or part["id"] in refreshed_uploads:
+                                    raise
+                                # The API confirmed waiting-file, so no parsed work is discarded.
+                                refreshed_uploads.add(part["id"])
+                                part["status"] = "new"
+                                part.pop("batch_id", None)
+                                part.pop("upload_url", None)
+                                part.pop("uploaded_at", None)
                     elif status in {"pending", "running", "converting"}:
                         part["status"] = status
                     else:

@@ -6,8 +6,7 @@ OpenAI-compatible provider selection, and resumable chunk cache.
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -17,9 +16,11 @@ import sys
 import time
 
 from inline_semantics import find_inline_artifacts, normalize_inline_output, protect_inline_semantics
-from mineru_sidecar import load_mineru_sidecar, strip_excluded_lines, write_sidecar_summary
 from table_utils import html_table_blocks, iter_cells, parse_html_tables, render_html_table
-from task_state import check_cancel
+from task_state import check_cancel, TaskCancelled, fingerprint, read_json, redact, write_json
+from document_blocks import blocks as document_blocks, segments as structure_segments
+from http_client import request as http_request, thread_session, RemoteError
+from translation_checks import validate_protected, concerns, numbers, TOKEN
 
 
 # -- Config -----------------------------------------------------------
@@ -47,10 +48,14 @@ class ProviderConfig:
     provider_name: str
     base_url: str
     api_key_env: str
-    api_key: str
+    api_key: str = field(repr=False)
     model: str
     temperature: float = 0.1
     timeout: int = 180
+    cancel_event: object = field(default=None, repr=False, compare=False)
+    metrics: object = field(default=None, repr=False, compare=False)
+    phase: str = "body"
+    is_retry: bool = False
 
     def endpoint(self) -> str:
         base = self.base_url.strip().rstrip("/")
@@ -172,12 +177,10 @@ def normalize_abstract_heading(text: str) -> str:
 
 
 def split_references(md_text: str) -> tuple[str, str]:
-    match = REFERENCE_HEADING_RE.search(md_text)
-    if not match:
-        return md_text, ""
-    body = md_text[: match.start()].rstrip()
-    refs = md_text[match.start() :].strip() + "\n"
-    return body, refs
+    parts = document_blocks(md_text)
+    body = "\n\n".join(p.text for p in parts if p.kind != "reference")
+    refs = "\n\n".join(p.text for p in parts if p.kind == "reference")
+    return body, refs + "\n" if refs else ""
 
 
 def normalize_references(refs: str) -> tuple[str, dict]:
@@ -243,8 +246,8 @@ def _store_placeholder(kind: str, value: str, placeholders: dict[str, str]) -> s
     return token
 
 
-def protect_fragments(text: str) -> tuple[str, dict[str, str]]:
-    placeholders: dict[str, str] = {}
+def protect_fragments(text: str, placeholders=None) -> tuple[str, dict[str, str]]:
+    placeholders = placeholders if placeholders is not None else {}
 
     def protect_table(match):
         return _store_placeholder("TABLE", match.group(0), placeholders)
@@ -254,15 +257,17 @@ def protect_fragments(text: str) -> tuple[str, dict[str, str]]:
 
     text = TABLE_RE.sub(protect_table, text)
     text = IMAGE_RE.sub(protect_image, text)
+    text = re.sub(r"\[(?:\d{1,4}(?:\s*[-–,;]\s*\d{1,4})*)\]", lambda m: _store_placeholder("CITATION", m[0], placeholders), text)
 
     text = protect_inline_semantics(text, lambda kind, value: _store_placeholder(kind, value, placeholders))
     return text, placeholders
 
 
 def restore_placeholders(text: str, placeholders: dict[str, str]) -> str:
+    text = normalize_inline_output(text)
     for token, value in placeholders.items():
         text = text.replace(token, value)
-    return normalize_inline_output(text)
+    return text
 
 
 def clean_translation_text(text: str) -> str:
@@ -280,6 +285,7 @@ def clean_latex(text: str) -> str:
 
 # -- OpenAI-compatible chat API --------------------------------------
 def call_chat_completion(config: ProviderConfig, messages, timeout: int | None = None) -> str:
+    check_cancel(config.cancel_event)
     if not config.api_key:
         raise ValueError(
             f"Missing API key for {config.provider_name}. "
@@ -288,14 +294,27 @@ def call_chat_completion(config: ProviderConfig, messages, timeout: int | None =
     if not config.model:
         raise ValueError("Model is empty. Please choose or enter a model name.")
 
-    import requests as req
-
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {"model": config.model, "messages": messages, "temperature": config.temperature}
-    resp = req.post(config.endpoint(), headers=headers, json=payload, timeout=timeout or config.timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"].get("content", "")
+    started = time.monotonic()
+    resp, data = None, None
+    try:
+        resp = http_request(thread_session(), "POST", config.endpoint(), headers=headers, json=payload,
+                            timeout=timeout or config.timeout, cancel_event=config.cancel_event)
+        data = resp.json()
+    finally:
+        if resp is not None:
+            resp.close()
+        if config.metrics is not None:
+            config.metrics.append({"seconds": round(time.monotonic() - started, 3), "phase": config.phase,
+                                   "retry": config.is_retry, "usage": data.get("usage", {}) if isinstance(data, dict) else {}})
+    try:
+        choice = data["choices"][0]
+        if choice.get("finish_reason") in {"length", "content_filter"}:
+            raise ValueError("模型响应截断或被过滤，不能作为完整译文。")
+        content = choice["message"].get("content", "")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("翻译服务返回了不完整的响应。") from exc
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -304,7 +323,9 @@ def call_chat_completion(config: ProviderConfig, messages, timeout: int | None =
             else:
                 parts.append(str(item))
         content = "".join(parts)
-    return str(content).strip()
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("模型返回空译文。")
+    return content.strip()
 
 
 def list_available_models(config: ProviderConfig) -> list[str]:
@@ -322,7 +343,7 @@ def list_available_models(config: ProviderConfig) -> list[str]:
     )
     resp.raise_for_status()
     data = resp.json()
-    items = data.get("data", data if isinstance(data, list) else [])
+    items = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
     models = []
     for item in items:
         if isinstance(item, dict) and item.get("id"):
@@ -358,74 +379,8 @@ Rules:
 
 
 # -- Segmentation -----------------------------------------------------
-def _split_long_block(text: str, max_chunk: int) -> list[str]:
-    if len(text) <= max_chunk:
-        return [text.strip()] if text.strip() else []
-
-    chunks: list[str] = []
-    buf = ""
-    paragraphs = re.split(r"\n\n+", text)
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-        if len(paragraph) > max_chunk:
-            pieces = re.split(r"(?<=[.!?。！？])\s+", paragraph)
-        else:
-            pieces = [paragraph]
-        for piece in pieces:
-            if not piece:
-                continue
-            if len(piece) > max_chunk:
-                hard_parts = [piece[i : i + max_chunk] for i in range(0, len(piece), max_chunk)]
-            else:
-                hard_parts = [piece]
-            for part in hard_parts:
-                if len(buf) + len(part) + 2 <= max_chunk:
-                    buf = f"{buf}\n\n{part}".strip()
-                else:
-                    if buf:
-                        chunks.append(buf)
-                    buf = part
-    if buf:
-        chunks.append(buf)
-    return chunks
-
-
-def _merge_small_segments(chunks: list[str], min_chunk: int, max_chunk: int) -> list[str]:
-    merged: list[str] = []
-    buf = ""
-    for chunk in chunks:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if not buf:
-            buf = chunk
-            continue
-        if len(buf) < min_chunk and len(buf) + len(chunk) + 2 <= max_chunk:
-            buf = f"{buf}\n\n{chunk}"
-        else:
-            merged.append(buf)
-            buf = chunk
-    if buf:
-        merged.append(buf)
-    return merged
-
-
 def split_body_into_segments(body: str, max_chunk: int = 10000, min_chunk: int = 1800) -> list[str]:
-    segs = re.split(r"(?m)^(?=#{1,2} )", body)
-    chunks: list[str] = []
-    for seg in segs:
-        seg = seg.strip()
-        if not seg:
-            continue
-        if len(seg) <= max_chunk:
-            chunks.append(seg)
-            continue
-        subs = re.split(r"(?m)^(?=### )", seg)
-        for sub in subs:
-            chunks.extend(_split_long_block(sub, max_chunk))
-    return _merge_small_segments(chunks, min_chunk, max_chunk)
+    return structure_segments(body, max_chunk, min_chunk)
 
 
 def segment_document(md_text, max_chunk=5000):
@@ -636,14 +591,16 @@ def _hash_text(*parts: str) -> str:
 
 
 def _read_cache(cache_path: Path) -> str | None:
-    if cache_path.exists():
-        return cache_path.read_text(encoding="utf-8")
+    data = read_json(cache_path)
+    if isinstance(data, dict) and data.get("version") == 2 and isinstance(data.get("text"), str):
+        if data["text"].strip() and data.get("sha256") == fingerprint(data["text"]):
+            return data["text"]
     return None
 
 
 def _write_cache(cache_path: Path, text: str):
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(text, encoding="utf-8")
+    if text.strip():
+        write_json(cache_path, {"version": 2, "text": text, "sha256": fingerprint(text)})
 
 
 # -- Table translation ------------------------------------------------
@@ -683,12 +640,22 @@ def _translate_text_batch(
 
     payload = json.dumps(protected_items, ensure_ascii=False)
     system_prompt = TABLE_SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "")
-    key = _hash_text(config.provider_name, config.base_url, config.model, system_prompt, payload)
+    check_cancel(config.cancel_event)
+    key = _hash_text(config.provider_name, config.base_url, config.model, str(config.temperature), system_prompt, payload)
     cache_path = cache_dir / f"{prefix}_{key}.json"
     cached = _read_cache(cache_path)
     if cached is not None:
-        translated_items = json.loads(cached)
-    else:
+        try:
+            translated_items = json.loads(cached)
+            if not isinstance(translated_items, list) or len(translated_items) != len(items):
+                raise ValueError("Invalid cached table length")
+            for original, translated in zip(protected_items, translated_items):
+                validate_protected(original, translated)
+                if numbers(original) != numbers(translated):
+                    raise ValueError("Cached table numbers changed")
+        except (ValueError, TypeError):
+            cached = None
+    if cached is None:
         response = call_chat_completion(
             config,
             [
@@ -699,6 +666,26 @@ def _translate_text_batch(
         translated_items = _extract_json_array(response)
         if not isinstance(translated_items, list) or len(translated_items) != len(items):
             raise ValueError("Table translation response length did not match input length.")
+        for original, translated in zip(protected_items, translated_items):
+            validate_protected(original, translated)
+            if numbers(original) != numbers(translated):
+                raise ValueError("表格译文改变了数字。")
+        suspect = [i for i, text in enumerate(translated_items) if find_untranslated_table_english(TOKEN.sub("", text))]
+        if suspect:
+            try:
+                correction = call_chat_completion(replace(config, is_retry=True), [
+                    {"role": "system", "content": system_prompt + "\nCheck untranslated ordinary words carefully; preserve clear names and acronyms."},
+                    {"role": "user", "content": json.dumps([protected_items[i] for i in suspect], ensure_ascii=False)},
+                ])
+                candidates = _extract_json_array(correction)
+                if not isinstance(candidates, list) or len(candidates) != len(suspect):
+                    raise ValueError("Correction length mismatch")
+                for i, candidate in zip(suspect, candidates):
+                    validate_protected(protected_items[i], candidate)
+                    if numbers(protected_items[i]) == numbers(candidate) and len(find_untranslated_table_english(TOKEN.sub("", candidate))) < len(find_untranslated_table_english(TOKEN.sub("", translated_items[i]))):
+                        translated_items[i] = candidate
+            except (RemoteError, ValueError, TypeError):
+                pass  # Keep the already validated first candidate.
         _write_cache(cache_path, json.dumps(translated_items, ensure_ascii=False, indent=2))
 
     restored = []
@@ -719,14 +706,17 @@ def _translate_text_batch_resilient(
         return []
     try:
         return _translate_text_batch(items, config, cache_dir, prefix, consistency_guide)
+    except (TaskCancelled, RemoteError):
+        raise
     except Exception as exc:
         if len(items) == 1:
             if failures is not None:
-                failures.append(f"{items[0][:80]} :: {exc}")
+                failures.append(f"{items[0][:80]} :: {redact(exc, [config.api_key])}")
             return [items[0]]
         mid = len(items) // 2
-        left = _translate_text_batch_resilient(items[:mid], config, cache_dir, prefix, consistency_guide, failures)
-        right = _translate_text_batch_resilient(items[mid:], config, cache_dir, prefix, consistency_guide, failures)
+        retry_config = replace(config, is_retry=True)
+        left = _translate_text_batch_resilient(items[:mid], retry_config, cache_dir, prefix, consistency_guide, failures)
+        right = _translate_text_batch_resilient(items[mid:], retry_config, cache_dir, prefix, consistency_guide, failures)
         return left + right
 
 
@@ -744,7 +734,11 @@ def translate_table_cells(
     for i, item in enumerate(items):
         if not _needs_translation(item):
             continue
-        key = _hash_text("cell", item)
+        key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide, item)
+        if key not in translation_memory:
+            cached = _read_cache(cache_dir / f"cell_{key}.json")
+            if cached is not None:
+                translation_memory[key] = cached
         if key in translation_memory:
             result[i] = translation_memory[key]
         else:
@@ -763,16 +757,22 @@ def translate_table_cells(
                 unique_indexes[value] = []
                 unique_values.append(value)
             unique_indexes[value].append(index)
+        local_failures = []
         translated = _translate_text_batch_resilient(
             unique_values,
             config,
             cache_dir,
             "table",
             consistency_guide,
-            failures=failures,
+            failures=local_failures,
         )
+        if failures is not None:
+            failures.extend(local_failures)
         for source, value in zip(unique_values, translated):
-            translation_memory[_hash_text("cell", source)] = value
+            if not local_failures or source != value:
+                cell_key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide, source)
+                translation_memory[cell_key] = value
+                _write_cache(cache_dir / f"cell_{cell_key}.json", value)
             for index in unique_indexes[source]:
                 result[index] = value
         batch = []
@@ -840,77 +840,114 @@ def translate_tables_in_text(
 
 
 # -- Segment translation ---------------------------------------------
+def _protect_segment(segment):
+    placeholders, pieces = {}, []
+    for block in document_blocks(segment):
+        begin = _store_placeholder("BEGIN", "", placeholders)
+        if block.kind in {"reference", "code"}:
+            protected = _store_placeholder("REFERENCE" if block.kind == "reference" else "CODE", block.text, placeholders)
+        else:
+            protected, _ = protect_fragments(block.text, placeholders)
+        finish = _store_placeholder("END", "", placeholders)
+        pieces.append(f"{begin}\n{protected}\n{finish}")
+    return "\n\n".join(pieces), placeholders
+
+
 def translate_segment(
-    segment,
-    prev_context,
-    idx,
-    total,
-    config: ProviderConfig | None = None,
-    cache_dir: Path | None = None,
-    consistency_guide: str = "",
-    translation_memory: dict[str, str] | None = None,
-    quality_warnings: list[dict] | None = None,
+    segment, prev_context, idx, total, config=None, cache_dir=None, consistency_guide="",
+    translation_memory=None, quality_warnings=None, next_context="", chapter_context="",
 ):
     config = config or resolve_provider_config()
+    check_cancel(config.cancel_event)
     cache_dir = cache_dir or (OUTPUT_ROOT / "_cache")
     translation_memory = translation_memory if translation_memory is not None else {}
-    memory_key = _hash_text("segment", segment)
-    if memory_key in translation_memory:
-        return translation_memory[memory_key]
-
-    protected, placeholders = protect_fragments(segment)
-    ctx = f"Previous section context for terminology only, do not translate or output it: {prev_context[:200]}\n\n" if prev_context else ""
-    prompt = (
-        f"{ctx}"
-        f"Translate only the text between <SOURCE> and </SOURCE> ({idx}/{total}).\n"
-        f"Do not output the <SOURCE> tags.\n\n"
-        f"<SOURCE>\n{protected}\n</SOURCE>"
+    protected, placeholders = _protect_segment(segment)
+    context = (
+        f"Current chapter: {chapter_context[:200]}\n"
+        f"Previous source excerpt (read-only): {prev_context[-300:]}\n"
+        f"Next source excerpt (read-only): {next_context[:300]}\n"
+        "These excerpts are context only. Never translate or output them.\n\n"
     )
+    instruction = (
+        context + "Translate only the text between <SOURCE> and </SOURCE>.\n"
+        "Preserve ALL [[[TP_...]]] tokens exactly, including BEGIN and END, in their original order. "
+        "Every BEGIN/END pair must contain the complete corresponding paragraph. "
+        "Do not output SOURCE tags or any content outside the block markers.\n\n"
+    )
+    prompt = instruction + f"<SOURCE>\n{protected}\n</SOURCE>"
     system_prompt = SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "")
-    key = _hash_text(config.provider_name, config.base_url, config.model, system_prompt, prompt)
-    cache_path = cache_dir / f"seg_{idx:04d}_{key}.md"
-    cached = _read_cache(cache_path)
+    key = _hash_text("validated-v3", config.provider_name, config.base_url, config.model,
+                     str(config.temperature), system_prompt, prompt, segment)
+    cache_path = cache_dir / f"seg_{key}.json"
+
+    pair_pattern = r"\[\[\[TP_BEGIN_\d+\]\]\][\s\S]*?\[\[\[TP_END_\d+\]\]\]"
+    source_pairs = re.findall(pair_pattern, protected)
+
+    def block_issues(original, candidate):
+        return concerns(original, candidate) + find_untranslated_english(candidate)
+
+    def issues(candidate):
+        return [f"段落 {i + 1}：{issue}" for i, (original, result) in enumerate(zip(source_pairs, re.findall(pair_pattern, candidate)))
+                for issue in block_issues(original, result)]
+
+    def finish(candidate):
+        warnings = issues(candidate)
+        if warnings and quality_warnings is not None:
+            quality_warnings.append({"segment": idx, "phrases": warnings})
+        translation_memory[key] = candidate
+        payloads = re.findall(r"\[\[\[TP_BEGIN_\d+\]\]\]([\s\S]*?)\[\[\[TP_END_\d+\]\]\]", candidate)
+        return "\n\n".join(restore_placeholders(payload.strip(), placeholders).strip() for payload in payloads)
+
+    cached = translation_memory.get(key) or _read_cache(cache_path)
     if cached is not None:
-        translation_memory[memory_key] = cached
-        return cached
-
-    def request_translation(user_prompt: str):
-        return call_chat_completion(
-            config,
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-
-    for attempt in range(3):
         try:
-            translated = request_translation(prompt)
-            translated = restore_placeholders(clean_translation_text(translated), placeholders)
-            warnings = find_untranslated_english(translated)
-            if warnings:
-                retry_prompt = (
-                    prompt
-                    + "\n\nThe previous translation left these ordinary English phrases untranslated: "
-                    + "; ".join(warnings)
-                    + "\nTranslate those phrases into Chinese unless they are author, institution, journal, or reference names."
-                )
-                retry = request_translation(retry_prompt)
-                retry = restore_placeholders(clean_translation_text(retry), placeholders)
-                retry_warnings = find_untranslated_english(retry)
-                if len(retry_warnings) <= len(warnings):
-                    translated = retry
-                    warnings = retry_warnings
-            if warnings and quality_warnings is not None:
-                quality_warnings.append({"segment": idx, "phrases": warnings})
-            _write_cache(cache_path, translated)
-            translation_memory[memory_key] = translated
-            return translated
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(2**attempt)
-    return segment
+            validate_protected(protected, cached)
+            return finish(cached)
+        except ValueError:
+            translation_memory.pop(key, None)
+
+    if not _needs_translation(TOKEN.sub("", protected)):
+        return finish(protected)
+    best, best_issues, last_error = None, [], None
+    feedback, active_prompt, retry_indexes = "", prompt, None
+    for attempt in range(3):
+        check_cancel(config.cancel_event)
+        try:
+            candidate = clean_translation_text(call_chat_completion(replace(config, is_retry=attempt > 0), [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": active_prompt + feedback},
+            ]))
+            if retry_indexes is not None:
+                selected = "\n\n".join(source_pairs[i] for i in retry_indexes)
+                validate_protected(selected, candidate)
+                previous_pairs = re.findall(pair_pattern, best)
+                for i, replacement in zip(retry_indexes, re.findall(pair_pattern, candidate)):
+                    if len(block_issues(source_pairs[i], replacement)) < len(block_issues(source_pairs[i], previous_pairs[i])):
+                        previous_pairs[i] = replacement
+                candidate = "\n\n".join(previous_pairs)
+            validate_protected(protected, candidate)
+            candidate_issues = issues(candidate)
+            if best is None or len(candidate_issues) < len(best_issues):
+                best, best_issues = candidate, candidate_issues
+            if not best_issues or attempt > 0:
+                break
+            retry_indexes = [i for i, (original, result) in enumerate(zip(source_pairs, re.findall(pair_pattern, best))) if block_issues(original, result)]
+            selected = "\n\n".join(source_pairs[i] for i in retry_indexes)
+            active_prompt = instruction + f"<SOURCE>\n{selected}\n</SOURCE>"
+            feedback = "\n\nCheck these possible problems, preserving all other content and markers: " + "; ".join(best_issues)
+        except RemoteError:
+            if best is not None:
+                break
+            raise
+        except TaskCancelled:
+            raise
+        except (ValueError, TypeError) as exc:
+            last_error = exc
+            feedback = "\n\nThe last response failed integrity checks: " + str(exc) + " Return the complete block sequence."
+    if best is None:
+        raise ValueError(f"第 {idx} 段未通过完整性检查：{last_error}")
+    _write_cache(cache_path, best)
+    return finish(best)
 
 
 # -- Main pipeline ----------------------------------------------------
@@ -931,230 +968,11 @@ def run(
     parse_seconds=0,
 ):
     check_cancel(cancel_event)
-    config = resolve_provider_config(
-        provider=provider,
-        base_url=base_url,
-        api_key=api_key,
-        api_key_env=api_key_env,
-        model=model,
-        temperature=temperature,
-        timeout=timeout,
-    )
-
-    def progress(msg, **kw):
-        if progress_callback:
-            progress_callback({"msg": msg, **kw})
-
-    input_path = Path(input_folder)
-    if not input_path.exists():
-        raise FileNotFoundError(f"❌ Folder not found: {input_folder}")
-
-    md_files = sorted(input_path.glob("*.md"))
-    if not md_files:
-        raise FileNotFoundError(f"❌ No .md file in {input_folder}")
-    src_md = next((p for p in md_files if p.name.lower() == "full.md"), md_files[0])
-
-    sidecar = load_mineru_sidecar(input_path)
-    raw = normalize_abstract_heading(normalize_source_text(src_md.read_text(encoding="utf-8")))
-    raw, excluded_line_count = strip_excluded_lines(raw, sidecar)
-    title = extract_title(raw)
-    timestamp = time.strftime("%Y-%m-%d_%H%M")
-    safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)[:40]
-    auto_dirname = f"{timestamp}_{safe_title}"
-
-    out_dir = Path(output_dir) if output_dir else OUTPUT_ROOT / auto_dirname
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = out_dir / "_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    if sidecar.has_data:
-        write_sidecar_summary(sidecar, out_dir / "mineru_structure_summary.json")
-
-    progress(f"📁 Output: {out_dir}")
-    progress(f"📄 Source: {src_md.name}")
-    progress(f"🤖 Provider: {config.provider_name} / {config.model}")
-    progress(f"📏 Size: {len(raw)} chars")
-    if sidecar.has_data:
-        progress(
-            f"🧱 MinerU JSON: {len(sidecar.source_files)} files, "
-            f"{sum(sidecar.block_counts.values())} typed blocks, removed {excluded_line_count} header/footer/page lines"
-        )
-
-    consistency_guide = build_consistency_guide(raw)
-    term_audit_candidates = extract_term_audit_candidates(raw)
-    translation_memory: dict[str, str] = {}
-    table_reports: list[dict] = []
-    quality_warnings: list[dict] = []
-    reference_report = {"entries": 0, "continuation_lines_merged": 0, "numbering_jumps": []}
-
-    body_raw, refs = split_references(raw)
-    if refs:
-        (out_dir / "references_original.md").write_text(refs, encoding="utf-8")
-        refs, reference_report = normalize_references(refs)
-        (out_dir / "references_normalized.md").write_text(refs, encoding="utf-8")
-
-    progress("📊 Translating table cells...")
-    body_raw = translate_tables_in_text(
-        body_raw,
-        config,
-        cache_dir,
-        progress,
-        consistency_guide=consistency_guide,
-        translation_memory=translation_memory,
-        table_reports=table_reports,
-    )
-
-    segments = split_body_into_segments(body_raw)
-    progress(f"🧩 Segments: {len(segments)}")
-    for i, seg in enumerate(segments):
-        h = seg.split("\n")[0][:60]
-        progress(f"   {i + 1}. {h} ({len(seg)}c)")
-
-    _, source_images = extract_structure(raw)
-    progress(f"📷 Source images: {len(source_images)}")
-
-    translations = []
-    contexts = []
-    prev_ctx = ""
-    for seg in segments:
-        contexts.append(prev_ctx)
-        for line in seg.splitlines():
-            if line.startswith("#"):
-                prev_ctx = line[:200]
-                break
-
-    speed_mode = speed_mode or os.environ.get("AI_SPEED_MODE", "balanced")
-    if max_workers is None:
-        env_workers = os.environ.get("AI_MAX_WORKERS")
-        max_workers = int(env_workers) if env_workers and env_workers.isdigit() else None
-    speed_workers = {"safe": 1, "balanced": 2, "fast": 4}
-    workers = max_workers or speed_workers.get(str(speed_mode).lower(), 2)
-    workers = max(1, min(4, int(workers)))
-    progress(f"⚙️ Translation workers: {workers}")
-
-    if workers == 1:
-        for i, seg in enumerate(segments):
-            check_cancel(cancel_event)
-            progress(f"🌐 [{i + 1}/{len(segments)}]", segment=i + 1, total=len(segments))
-            translated = translate_segment(
-                seg,
-                contexts[i],
-                i + 1,
-                len(segments),
-                config=config,
-                cache_dir=cache_dir,
-                consistency_guide=consistency_guide,
-                translation_memory=translation_memory,
-                quality_warnings=quality_warnings,
-            )
-            translations.append(translated)
-            progress(f"✓ ({len(translated)}c)")
-    else:
-        translations = [""] * len(segments)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(
-                    translate_segment,
-                    seg,
-                    contexts[i],
-                    i + 1,
-                    len(segments),
-                    config,
-                    cache_dir,
-                    consistency_guide,
-                    translation_memory,
-                    quality_warnings,
-                ): i
-                for i, seg in enumerate(segments)
-            }
-            completed = 0
-            for future in concurrent.futures.as_completed(future_map):
-                check_cancel(cancel_event)
-                i = future_map[future]
-                translated = future.result()
-                translations[i] = translated
-                completed += 1
-                progress(f"✓ [{completed}/{len(segments)}] segment {i + 1} ({len(translated)}c)", segment=completed, total=len(segments))
-
-    body = "\n\n".join(translations)
-
-    body_lines = body.splitlines()
-    img_present = set()
-    for line in body_lines:
-        m = re.search(r"!\[[^\]]*\]\(([^)]+)\)", line)
-        if m:
-            img_present.add(m.group(1))
-
-    missing = [img for img in source_images if img["path"] not in img_present]
-    if missing:
-        progress(f"📷 Re-inserting {len(missing)} missing images...")
-        for img in missing:
-            sec_heading = img["section"]
-            sec_num = re.search(r"([\d.]+)", sec_heading)
-            insert_idx = -1
-
-            for j, line in enumerate(body_lines):
-                m = re.search(r"^(#{1,3})\s+([\d.]+)", line)
-                if m and sec_num and m.group(2).rstrip(".") == sec_num.group(1).rstrip("."):
-                    insert_idx = j + 1
-                    break
-
-            if insert_idx < 0:
-                heading_words = sec_heading.split()
-                keyword = heading_words[-1].lower() if heading_words else ""
-                for j, line in enumerate(body_lines):
-                    if keyword and line.startswith("#") and keyword in line.lower():
-                        insert_idx = j + 1
-                        break
-
-            if insert_idx >= 0:
-                block = [img["image_line"]] + img["captions"]
-                body_lines = body_lines[:insert_idx] + block + body_lines[insert_idx:]
-
-    result = "\n".join(body_lines).strip()
-    if refs:
-        result = result.rstrip() + "\n\n" + refs.strip() + "\n"
-    result = normalize_inline_output(result)
-    latex_artifacts = find_latex_artifacts(result)
-
-    out_md = out_dir / "translated.md"
-    out_md.write_text(result, encoding="utf-8")
-
-    out_docx = None
-    try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        from make_docx import make_docx
-
-        out_docx = out_dir / "translated.docx"
-        make_docx(result, out_docx, input_path)
-        progress(f"✅ DOCX: {out_docx}")
-    except Exception as e:
-        progress(f"⚠️ DOCX skipped: {e}")
-
-    log = out_dir / "translation.log"
-    log.write_text(
-        f"Source: {src_md}\n"
-        f"Title: {title}\n"
-        f"Segments: {len(segments)}\n"
-        f"Images: {len(source_images)} (re-inserted: {len(missing)})\n"
-        f"Provider: {config.provider_name}\n"
-        f"Base URL: {config.base_url}\n"
-        f"Model: {config.model}\n"
-        f"References isolated: {bool(refs)}\n"
-        f"MinerU JSON files: {', '.join(sidecar.source_files) if sidecar.source_files else 'none'}\n"
-        f"Header/footer/page lines removed: {excluded_line_count}\n"
-        f"Sidecar formulas found: {len(sidecar.formula_texts)}\n"
-        f"Table reports: {json.dumps(table_reports, ensure_ascii=False)}\n"
-        f"Quality warnings: {json.dumps(quality_warnings, ensure_ascii=False)}\n"
-        f"Reference normalization: {json.dumps(reference_report, ensure_ascii=False)}\n"
-        f"LaTeX artifacts: {json.dumps(latex_artifacts, ensure_ascii=False)}\n"
-        f"Term audit candidates: {json.dumps(term_audit_candidates[:40], ensure_ascii=False)}\n"
-        f"Speed mode: {speed_mode}, workers: {workers}\n"
-        f"Time: {time.strftime('%Y-%m-%d %H:%M')}\n",
-        encoding="utf-8",
-    )
-
-    progress(f"✅ MD: {out_md}")
-    return out_md, out_docx
+    from translation_job import run_job
+    config = resolve_provider_config(provider=provider, base_url=base_url, api_key=api_key,
+                                     api_key_env=api_key_env, model=model, temperature=temperature, timeout=timeout)
+    return run_job(sys.modules[__name__], config, input_folder, output_dir, progress_callback=progress_callback,
+                   speed_mode=speed_mode, max_workers=max_workers, cancel_event=cancel_event, parse_seconds=parse_seconds)
 
 
 def build_arg_parser():
@@ -1174,9 +992,9 @@ def build_arg_parser():
     return parser
 
 
-if __name__ == "__main__":
-    args = build_arg_parser().parse_args()
-    run(
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    md, _ = run(
         args.input_folder,
         args.output_dir_opt or args.output_dir_pos,
         model=args.model,
@@ -1188,4 +1006,12 @@ if __name__ == "__main__":
         timeout=args.timeout,
         speed_mode=args.speed_mode,
         max_workers=args.max_workers,
+        progress_callback=lambda info: print(info.get("msg", ""), flush=True),
     )
+    report = read_json(md.parent / "quality_report.json", {})
+    print(f"质量报告：{md.parent / 'quality_report.md'}")
+    return 1 if report.get("status") == "partial_failed" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
