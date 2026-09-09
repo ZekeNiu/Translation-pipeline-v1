@@ -72,4 +72,4 @@ python tests/manual_smoke.py
 
 该命令默认离线；显式添加 `--live --output tests/.artifacts/live` 才会使用已配置的翻译服务。样例和运行产物不进入 Git。
 
-[验收记录与回退方法](docs/validation-and-rollback.md) · [实现范围与后续取舍](docs/long_book_translation_roadmap.md)
+[验收记录与回退方法](docs/validation-and-rollback.md) · [解析后停留在 0/N 的修复与实测](docs/bugfix-20260909.md) · [实现范围与后续取舍](docs/long_book_translation_roadmap.md)

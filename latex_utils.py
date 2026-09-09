@@ -224,7 +224,8 @@ def latex_formula_to_readable(expr: str, strip_delimiters: bool = True) -> str:
         )
         for key, value in TEXT_SYMBOLS.items():
             expr = expr.replace(key, value)
-        for command in ("operatorname", "mathrm", "mathbf", "mathit", "text", "mbox", "textit", "textbf"):
+        group_commands = ("operatorname", "mathrm", "mathbf", "mathit", "mathsf", "boldsymbol", "text", "mbox", "textit", "textbf")
+        for command in group_commands:
             expr = _replace_group_command(expr, command)
         expr = _replace_text_script(expr, "textsuperscript", "^")
         expr = _replace_text_script(expr, "textsubscript", "_")
@@ -235,8 +236,14 @@ def latex_formula_to_readable(expr: str, strip_delimiters: bool = True) -> str:
         expr = re.sub(r"_\s*([A-Za-z0-9+\-])", lambda m: _format_script(m.group(1), "_"), expr)
         expr = re.sub(r"\^\s*\{([^{}]*)\}", lambda m: _format_script(m.group(1), "^"), expr)
         expr = re.sub(r"\^\s*([A-Za-z0-9+\-])", lambda m: m.group(1).translate(SUP), expr)
+        # Script groups can previously have blocked the enclosing font wrapper.
+        for command in group_commands:
+            expr = _replace_group_command(expr, command)
 
         expr = re.sub(r"[{}]", "", expr)
+        # TeX ignores ordinary spaces in numeric math tokens; OCR often inserts them.
+        expr = re.sub(r"(?<=\d)\s+(?=[\d.])|(?<=\.)\s+(?=\d)", "", expr)
+        expr = re.sub(r"(?<=\d)\s+(?=°)", "", expr)
         expr = re.sub(r"\\(?=\s|[,.;:])", "", expr)
         expr = re.sub(r"\s*/\s*", "/", expr)
         expr = re.sub(r"\s+([,\.;:\]\)])", r"\1", expr)

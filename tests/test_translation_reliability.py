@@ -11,7 +11,7 @@ import translate
 from document_blocks import blocks, split_prose
 from http_client import RemoteError
 from task_state import TaskCancelled, read_json
-from translation_checks import concerns, validate_protected
+from translation_checks import concerns, validate_protected, numbers
 
 
 CFG = translate.ProviderConfig('custom', 'https://example.invalid/v1', 'KEY', 'dummy-secret', 'model')
@@ -25,6 +25,23 @@ def echo_source(config, messages, timeout=None):
 
 
 class StructureTests(unittest.TestCase):
+    def test_translated_dates_compare_by_calendar_value(self):
+        for english, chinese in [('11 Jul 2017', '2017年7月11日'), ('25 May 1996', '1996年5月25日'), ('August 12, 2017', '2017年8月12日'), ('16 Dec 91', '91年12月16日')]:
+            self.assertEqual(numbers(english), numbers(chinese))
+        self.assertNotEqual(numbers('11 Jul 2017'), numbers('2017年7月12日'))
+        self.assertNotEqual(numbers('11 Jul 2017'), numbers('2018年7月11日'))
+        self.assertNotEqual(numbers('May increase by 5'), numbers('可能增加6'))
+        self.assertNotEqual(numbers('16 Dec 91'), numbers('1991年12月16日'))
+
+    def test_equivalent_scientific_notation_and_written_counts(self):
+        examples = [('1920x1080 px; 0 % and 100 %', '1920×1080像素；0%和100%'),
+                    ('3D coordinates', '三维坐标'), ('Thirteen athletes finished; 88.26 m in 4th place.', '13名运动员完赛；第四名为88.26米。'),
+                    ('7 World Championships', '七届世界锦标赛')]
+        for original, result in examples:
+            self.assertNotIn('数字可能发生变化', concerns(original, result))
+        self.assertIn('数字可能发生变化', concerns('Thirteen athletes, 88.26 m in 4th place.', '14名运动员，第四名为88.26米。'))
+        self.assertIn('数字可能发生变化', concerns('1920x1080 px', '1920×1070像素'))
+
     def test_numbers_adjacent_to_chinese_are_not_false_alarms(self):
         self.assertEqual(concerns('Table 1: 45 seconds and 2 minutes.', '表1：45秒和2分钟。'), [])
         self.assertIn('数字可能发生变化', concerns('Table 1: 45 seconds.', '表1：46秒。'))
@@ -67,6 +84,17 @@ class StructureTests(unittest.TestCase):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_bad_table_cell_does_not_retry_accepted_neighbors(self):
+        prompts = []
+        def fake(config, messages):
+            values = json.loads(messages[-1]['content'])
+            prompts.append(values)
+            return json.dumps(['已合格', '时间为46秒'] if len(values) == 2 else ['时间为45秒'])
+        with tempfile.TemporaryDirectory() as td, patch('translate.call_chat_completion', side_effect=fake):
+            result = translate.translate_table_cells(['Good', 'Time 45 seconds'], CFG, Path(td))
+        self.assertEqual(result, ['已合格', '时间为45秒'])
+        self.assertEqual(prompts, [['Good', 'Time 45 seconds'], ['Time 45 seconds']])
+
     def test_only_suspicious_paragraph_is_sent_for_revision(self):
         prompts = []
         def fake(config, messages):
@@ -151,6 +179,41 @@ class TranslationTests(unittest.TestCase):
 
 
 class JobTests(unittest.TestCase):
+    def test_plain_cover_uses_original_pdf_name(self):
+        from translation_job import _document_title
+        from task_state import write_json
+        write_json(self.root.parent / 'parse_state.json', {'parts': [{'path': 'D:/books/Academic report.pdf'}]})
+        self.assertEqual(_document_title(translate, 'Cover without heading\n\n## Methods', self.root, self.source), 'Academic report')
+
+    def test_progress_identifies_table_and_body_before_completion(self):
+        self.source.write_text('<table><tr><td>Text</td></tr></table>\n\nBody.', encoding='utf-8')
+        events = []
+        def fake(config, messages):
+            self.assertTrue(any(e.get('current_segment') == 1 for e in events))
+            return '["正文"]' if config.phase == 'table' else echo_source(config, messages)
+        with patch('translate.call_chat_completion', side_effect=fake):
+            translate.run(self.root, self.out, progress_callback=events.append, **self.kw)
+        self.assertTrue(any('表格 1/1' in e['msg'] for e in events))
+        self.assertTrue(any('正文' in e['msg'] for e in events))
+        self.assertFalse(next(e for e in events if e['stage'] == 'prepare')['artifact_ready'])
+
+    def test_waiting_status_updates_without_repeating_log_lines(self):
+        import itertools
+        release, events = threading.Event(), []
+        self.source.write_text('Short text.', encoding='utf-8')
+        def progress(event):
+            events.append(event)
+            if event.get('log') is False:
+                release.set()
+        def fake(config, messages):
+            if not release.wait(5):
+                raise AssertionError('No waiting progress while the request is running')
+            return echo_source(config, messages)
+        with patch('translate.call_chat_completion', side_effect=fake), patch('translation_job.time.monotonic', side_effect=itertools.count(0, 11).__next__):
+            translate.run(self.root, self.out, progress_callback=progress, **self.kw)
+        self.assertTrue(any('等待' in e['msg'] and e.get('log') is False for e in events))
+        self.assertEqual(read_json(self.out / 'quality_report.json')['status'], 'completed')
+
     def test_cli_returns_failure_status_for_partial_output(self):
         import io
         data = io.BytesIO()
@@ -193,6 +256,21 @@ class JobTests(unittest.TestCase):
             second, _ = translate.run(self.root, **self.kw)
         self.assertEqual(first, second)
         self.assertEqual(call.call_count, count)
+
+    def test_new_checks_and_better_title_keep_existing_request_cache(self):
+        from task_state import write_json
+        self.source.write_text('Short text.', encoding='utf-8')
+        default = Path(self.temp.name) / 'default'
+        with patch('translate.OUTPUT_ROOT', default), patch('translate.call_chat_completion', side_effect=echo_source) as call:
+            first, _ = translate.run(self.root, **self.kw)
+            state = read_json(first.parent / 'task_state.json')
+            state.pop('checks_version')
+            write_json(first.parent / 'task_state.json', state)
+            write_json(self.root.parent / 'parse_state.json', {'source_name': 'Actual report.pdf'})
+            second, _ = translate.run(self.root, **self.kw)
+        self.assertEqual(first, second)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(read_json(first.parent / 'task_state.json')['checks_version'], 2)
 
     def test_failed_segment_only_is_retried(self):
         parts = ['# First\n\nShort text.', '# Second\n\nOther text.']

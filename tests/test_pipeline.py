@@ -15,6 +15,13 @@ from translate import ProviderConfig
 
 
 class PipelineQualityTests(unittest.TestCase):
+    def test_ocr_math_font_commands_and_spaced_digits_are_readable(self):
+        self.assertEqual(latex_to_readable_text(r'$3 9 . 7 ^ { \circ }$'), '39.7°')
+        self.assertEqual(latex_to_readable_text(r'$\left(\mathsf{D}_{\mathsf{i m p}}\right)$'), '(Dᵢₘₚ)')
+        value = latex_to_readable_text(r'$\boldsymbol{-0 . 3 ^ {\circ}}$')
+        self.assertNotIn('\\', value)
+        self.assertIn('-0.3', value)
+
     def test_inline_images_preserve_surrounding_text_in_docx(self):
         import base64
         with tempfile.TemporaryDirectory() as td:

@@ -56,6 +56,7 @@ class ProviderConfig:
     metrics: object = field(default=None, repr=False, compare=False)
     phase: str = "body"
     is_retry: bool = False
+    request_progress: object = field(default=None, repr=False, compare=False)
 
     def endpoint(self) -> str:
         base = self.base_url.strip().rstrip("/")
@@ -296,6 +297,8 @@ def call_chat_completion(config: ProviderConfig, messages, timeout: int | None =
 
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {"model": config.model, "messages": messages, "temperature": config.temperature}
+    if config.request_progress:
+        config.request_progress(config.is_retry)
     started = time.monotonic()
     resp, data = None, None
     try:
@@ -624,6 +627,12 @@ def _extract_json_array(text: str):
         raise
 
 
+class _CellValidationError(ValueError):
+    def __init__(self, accepted, invalid):
+        super().__init__("表格部分单元格未通过数字或结构检查。")
+        self.accepted, self.invalid = accepted, invalid
+
+
 def _translate_text_batch(
     items: list[str],
     config: ProviderConfig,
@@ -666,10 +675,17 @@ def _translate_text_batch(
         translated_items = _extract_json_array(response)
         if not isinstance(translated_items, list) or len(translated_items) != len(items):
             raise ValueError("Table translation response length did not match input length.")
-        for original, translated in zip(protected_items, translated_items):
-            validate_protected(original, translated)
-            if numbers(original) != numbers(translated):
-                raise ValueError("表格译文改变了数字。")
+        accepted, invalid = {}, []
+        for i, (original, translated) in enumerate(zip(protected_items, translated_items)):
+            try:
+                validate_protected(original, translated)
+                if numbers(original) != numbers(translated):
+                    raise ValueError("表格译文改变了数字。")
+                accepted[i] = restore_placeholders(translated, placeholder_maps[i])
+            except (ValueError, TypeError):
+                invalid.append(i)
+        if invalid:
+            raise _CellValidationError(accepted, invalid)
         suspect = [i for i, text in enumerate(translated_items) if find_untranslated_table_english(TOKEN.sub("", text))]
         if suspect:
             try:
@@ -715,6 +731,13 @@ def _translate_text_batch_resilient(
             return [items[0]]
         mid = len(items) // 2
         retry_config = replace(config, is_retry=True)
+        if isinstance(exc, _CellValidationError):
+            result = list(items)
+            for i, value in exc.accepted.items():
+                result[i] = value
+            for i in exc.invalid:
+                result[i] = _translate_text_batch_resilient([items[i]], retry_config, cache_dir, prefix, consistency_guide, failures)[0]
+            return result
         left = _translate_text_batch_resilient(items[:mid], retry_config, cache_dir, prefix, consistency_guide, failures)
         right = _translate_text_batch_resilient(items[mid:], retry_config, cache_dir, prefix, consistency_guide, failures)
         return left + right

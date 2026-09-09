@@ -292,10 +292,11 @@ class App:
                     self.progress.configure(value=100 * value.get("completed", value.get("segment", 0)) / value["total"])
                 if not self.cancel_event.is_set():
                     self.progress_label.configure(text=redact(value.get("msg", ""), self.active_secrets)[:240])
-                self._log(value.get("msg", ""))
+                if value.get("log", True):
+                    self._log(value.get("msg", ""))
                 if value.get("output_dir"):
                     self.result_dir = value["output_dir"]
-                    self.open_btn.configure(state="normal")
+                    self.open_btn.configure(state="normal" if value.get("artifact_ready", True) else "disabled")
             elif event in {"done", "stopped", "failed"}:
                 self.running = False
                 self.run_btn.configure(state="normal")

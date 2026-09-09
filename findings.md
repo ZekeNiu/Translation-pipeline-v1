@@ -10,3 +10,4 @@
 - Live sample found a numeric-check bug: Python Unicode word boundaries skipped digits adjacent to Chinese text. ASCII letter/digit boundaries now correctly match “为45秒” and “表1”.
 - Revisions operate only on paragraphs with identified concerns and preserve the other already-validated paragraphs. Retry timing is recorded separately without reducing checks or enabling extra concurrency.
 - DOCX visual inspection confirmed merged headers, formulas, images and references followed by translated discussion/appendix. MinerU OCR quality still requires a configured token and representative real books.
+- Follow-up real report: MinerU succeeded (33 pages); apparent stall was hidden table/model activity. English month dates becoming Chinese numeric months triggered whole-batch retries. Also observed equivalent percentage spacing, x/×, written counts, and unsupported DOCX mathsf/boldsymbol. See docs/bugfix-20260909.md.

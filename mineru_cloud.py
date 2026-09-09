@@ -97,10 +97,11 @@ def parse_official(input_path, base_url, api_key, output_root, *, timeout=180, p
                 part.pop("batch_id", None)
             else:
                 part["status"] = "pending" if part.get("batch_id") else "new"
-        state["status"] = "running"
+        state.update(status="running", source_name=source.name)
         write_json(manifest, state)
         deadline = time.monotonic() + max_wait
         refreshed_uploads, refreshed_downloads = set(), set()
+        last_progress = None
         while any(p["status"] not in {"done", "failed"} for p in parts):
             check_cancel(cancel_event)
             if time.monotonic() >= deadline:
@@ -177,7 +178,10 @@ def parse_official(input_path, base_url, api_key, output_root, *, timeout=180, p
                     write_json(manifest, state)
                 if progress:
                     done = sum(p["status"] == "done" for p in parts)
-                    progress({"stage": "parse", "msg": f"文档解析：已完成 {done}/{len(parts)} 个部分", "completed": done, "total": len(parts)})
+                    running = sum(p["status"] in {"running", "converting"} for p in parts)
+                    message = f"文档解析：已完成 {done}/{len(parts)} 个部分" + (f"；{running} 个正在解析" if running else "")
+                    progress({"stage": "parse", "msg": message, "completed": done, "total": len(parts), "log": message != last_progress})
+                    last_progress = message
             if any(p["status"] not in {"done", "failed", "new"} for p in parts):
                 interruptible_wait(poll_interval, cancel_event)
         failed = [p for p in parts if p["kind"] == "main" and p["status"] != "done"]

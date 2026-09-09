@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+import threading
 
 from document_blocks import blocks
 from mineru_sidecar import load_mineru_sidecar, strip_excluded_lines, write_sidecar_summary
@@ -24,6 +25,23 @@ def _source_hash(root, markdown, sidecar):
 
 def _excerpt(segment):
     return "\n".join(b.text for b in blocks(segment) if b.kind in {"heading", "text", "caption"})
+
+
+def _document_title(engine, raw, root, source):
+    title = engine.extract_title(raw)
+    if title != "translated":
+        return title
+    # MinerU may leave the cover as plain text instead of a level-one heading.
+    manifest = read_json(root.parent / "parse_state.json", {})
+    if isinstance(manifest, dict):
+        original = manifest.get("source_name")
+        if not original:
+            parts = manifest.get("parts", [])
+            if parts and isinstance(parts[0], dict):
+                original = parts[0].get("path")
+        if original:
+            return Path(original).stem
+    return source.stem if source.stem != "full" else root.name
 
 
 def _copy_images(text, source, output):
@@ -61,9 +79,16 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
     config_hash = fingerprint("pipeline-v5", config.provider_name, config.base_url, config.model, config.temperature,
                               engine.SYSPROMPT, engine.TABLE_SYSPROMPT)
     identity = fingerprint(document_hash, config_hash)
-    title = engine.extract_title(raw)
+    title = _document_title(engine, raw, root, source)
     safe_title = re.sub(r'[\\/:*?"<>|]', '_', title)[:40]
     out = Path(output_dir).resolve() if output_dir else engine.OUTPUT_ROOT / f"{safe_title}_{identity[:20]}"
+    if not output_dir and not out.exists():
+        # A better display name must not abandon an existing task's request cache.
+        for candidate in sorted(engine.OUTPUT_ROOT.glob(f"*_{identity[:20]}")):
+            saved = read_json(candidate / "task_state.json", {})
+            if isinstance(saved, dict) and saved.get("identity") == identity:
+                out = candidate
+                break
     if out.resolve().is_relative_to(root):
         raise ValueError("译文目录不能位于解析输入目录内，请选择另一个目录。")
     def progress(message, **info):
@@ -83,9 +108,13 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
                     if (out / name).is_file():
                         shutil.copy2(out / name, previous / name)
             state = {"version": 3, "identity": identity, "source_hash": document_hash, "config_hash": config_hash, "segments": {}}
+        if state.get("checks_version") != 2:
+            # Revalidate raw cached responses when rules change; no need to retranslate them.
+            state["segments"] = {}
+            state["checks_version"] = 2
         state.update(status="running", source=str(source), provider=config.provider_name, model=config.model)
         write_json(state_path, state)
-        progress(f"输出目录：{out}", stage="prepare", output_dir=str(out))
+        progress(f"译文完成后保存到：{out}", stage="prepare", output_dir=str(out), artifact_ready=False)
         try:
             return _execute(engine, config, raw, root, out, source, sidecar, excluded, state, state_path,
                             progress, speed_mode, max_workers, cancel_event, parse_seconds)
@@ -153,24 +182,47 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
             record["status"] = "pending"
             pending.append(i)
     completed = len(ids) - len(pending)
+    write_json(state_path, state)
     progress(f"翻译：{completed}/{len(ids)} 段已完成，可复用已校验结果", stage="translate", completed=completed, total=len(ids))
+    active, activity_lock = {}, threading.Lock()
+    def activity(index, label, retry=False):
+        display = label + ("，校验重试" if retry else "")
+        with activity_lock:
+            changed = active.get(index, (None,))[0] != display
+            active[index] = (display, time.monotonic())
+        if changed:
+            progress(f"第 {index + 1}/{len(ids)} 段：{label}" + ("，正在修订检查项" if retry else ""),
+                     stage="translate", completed=completed, total=len(ids), current_segment=index + 1)
+
+    def waiting_progress():
+        now = time.monotonic()
+        with activity_lock:
+            details = "；".join(f"第 {i + 1} 段{label}，等待 {int(now - since)} 秒" for i, (label, since) in sorted(active.items()))
+        progress(f"翻译：{completed}/{len(ids)} 段完成；{details}", stage="translate", completed=completed, total=len(ids), log=False)
     # Each worker has its own memory; persisted request caches handle the next run.
     def worker(index):
         check_cancel(cancel_event)
         local_tables, local_warnings, memory = [], [], {}
         started = time.monotonic()
         pieces = []
+        table_index, table_total = 0, sum(b.kind == "table" for b in blocks(segments[index]))
         for block in blocks(segments[index]):
             check_cancel(cancel_event)
             if block.kind == "table":
-                pieces.append(engine.translate_tables_in_text(block.text, replace(config, phase="table"), cache_dir, lambda *_a, **_kw: None,
+                table_index += 1
+                label = f"表格 {table_index}/{table_total}"
+                activity(index, label)
+                table_config = replace(config, phase="table", request_progress=lambda retry, label=label: activity(index, label, retry))
+                pieces.append(engine.translate_tables_in_text(block.text, table_config, cache_dir, lambda *_a, **_kw: None,
                                                               consistency_guide=guide, translation_memory=memory, table_reports=local_tables))
             else:
                 pieces.append(block.text)
         table_seconds = time.monotonic() - started
         started = time.monotonic()
+        activity(index, "正文")
+        body_config = replace(config, request_progress=lambda retry: activity(index, "正文", retry))
         translated = engine.translate_segment("\n\n".join(pieces), excerpts[index - 1][-300:] if index else "", index + 1, len(ids),
-                                               config=config, cache_dir=cache_dir, consistency_guide=guide, translation_memory=memory,
+                                               config=body_config, cache_dir=cache_dir, consistency_guide=guide, translation_memory=memory,
                                                quality_warnings=local_warnings, next_context=excerpts[index + 1][:300] if index + 1 < len(ids) else "",
                                                chapter_context=chapters[index])
         for report in local_tables:
@@ -178,6 +230,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         return translated, local_tables, local_warnings, table_seconds, time.monotonic() - started
 
     started, table_seconds, body_seconds = time.monotonic(), 0, 0
+    last_heartbeat = started
     fatal = None
     pending_iter = iter(pending)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -190,9 +243,14 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         for _ in range(workers):
             submit_next()
         while futures:
-            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            done, _ = concurrent.futures.wait(futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED)
+            if time.monotonic() - last_heartbeat >= 10:
+                waiting_progress()
+                last_heartbeat = time.monotonic()
             for future in done:
                 index = futures.pop(future)
+                with activity_lock:
+                    active.pop(index, None)
                 record = state["segments"][ids[index]]
                 try:
                     translated, tables, issues, ts, bs = future.result()
@@ -228,7 +286,8 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     parse_report = read_json(root / "parse_report.json", {})
     parse_warnings = parse_report.get("warnings", [])
     failed = [i + 1 for i, key in enumerate(ids) if state["segments"][key].get("status") not in {"completed", "needs_review"}]
-    artifacts = engine.find_latex_artifacts(result)
+    # Valid LaTeX in Markdown is expected. Report commands that remain after Word conversion.
+    artifacts = engine.find_latex_artifacts(engine.normalize_inline_output(result))
     status = "partial_failed" if failed else "needs_review" if warnings or parse_warnings or missing_images or artifacts or any(r["residual_english"] or r["inline_artifacts"] for r in table_reports) else "completed"
     progress("正在保存译文与质量报告…", stage="export")
     atomic_write(out / "translated.md", result)
@@ -268,9 +327,18 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         lines.append(f"- 原文页码 {issue.get('pages')}：{issue.get('reason')}")
     for issue in missing_images:
         lines.append(f"- 图片 {issue['path']}：{issue['reason']}")
+    table_numbers = {}
     for table in table_reports:
+        table_numbers[table['segment']] = table_numbers.get(table['segment'], 0) + 1
         if table["failures"] or table["residual_english"] or table["inline_artifacts"]:
-            lines.append(f"- 第 {table['segment']} 段表格：请核对未翻译单元格、残留英文或格式疑点。")
+            details = []
+            if table['failures']:
+                details.append(f"{len(table['failures'])} 个单元格未完成")
+            if table['residual_english']:
+                details.append('英文候选（可能是专名）：' + '、'.join(table['residual_english'][:3]))
+            if table['inline_artifacts']:
+                details.append('格式标记需核对')
+            lines.append(f"- 第 {table['segment']} 段，表格 {table_numbers[table['segment']]}：" + '；'.join(details))
     if artifacts:
         lines.append("- 公式存在未处理标记，请核对：" + ", ".join(artifacts[:10]))
     if export_error:
