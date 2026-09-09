@@ -15,4 +15,4 @@ Validation: 80 Windows regression tests pass; generated academic sample translat
 - [done] Reproduce against the authorized 33-page document; verify original MinerU task and source hash.
 - [done] Fix date/notation false positives, selective cell retries, substage/elapsed progress, original filename fallback, and observed Word formula rendering defects.
 - [done] 88 local tests pass; live task completed 8/8, 11 tables and 29 images; no-new-request resume succeeds; Word/PDF visual check performed.
-- [in progress] Publish fix branch, verify CI, merge main and verify remote.
+- [done] Fix branch published; GitHub Windows Python 3.11/3.14 tests pass (run 34319874773); merge and remote verification recorded in the delivery response.
