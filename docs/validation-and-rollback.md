@@ -13,7 +13,7 @@
 - 长 HTML 表格与公式不截断、参考文献后续章节保留、空译文 / 截断 / 标记缺失与乱序拒收、只修订疑点段落、失败单元格不缓存成功、缓存损坏和配置变化、停止后继续。
 - Word 合并单元格、内嵌图片前后文字保留、图片导出失败报告。
 
-已配置 GitHub Actions，在 Windows 的 Python 3.11 / 3.14 上运行相同回归测试；具体运行状态以[仓库 Actions](https://github.com/ZekeNiu/Translation-pipeline-v1/actions/workflows/tests.yml)为准。
+GitHub Actions 在 Windows 的 Python 3.11 / 3.14 上均通过全部 80 项测试，对应代码提交为 `8902d98`，见[成功运行记录](https://github.com/ZekeNiu/Translation-pipeline-v1/actions/runs/34300187632)。该代码已合入并推送 `main`，远端提交和基线回退标签均已核对。后续验收记录提交只修改文档。
 
 ## 真实小样本与视觉检查
 
@@ -42,6 +42,6 @@ git switch --detach rollback/pre-mineru-improvements-20260908
 2. `39b8f57`：官网解析与 PDF 拆分。
 3. `555bd64`：质量与续跑，包含验收发现的解析和界面补充修正。
 
-后续 `Handle Chinese CLI output on non-Chinese Windows` 提交修复了 CI 暴露的命令行编码问题：英文 Windows 的重定向输出默认 cp1252，打印中文路径可能失败；CLI 现使用 UTF-8，回归测试显式模拟旧编码验证。撤销全部功能时先撤销此修复，再撤销上述三个功能提交。
+后续 `8902d98` 提交修复了 CI 暴露的命令行编码问题：英文 Windows 的重定向输出默认 cp1252，打印中文路径可能失败；CLI 现使用 UTF-8，回归测试显式模拟旧编码验证。撤销全部功能时先撤销此修复，再撤销上述三个功能提交。
 
 若希望在 `main` 撤销某项改动且保留历史，可查看 `git log --oneline`，使用 `git revert <提交号>` 创建撤销提交，再 `git push origin main`。阶段之间存在依赖；撤销全部功能时按最新功能提交、`39b8f57`、`2d27364` 的顺序逐个撤销，并运行测试。避免只撤销底层配置或解析模块而保留依赖它的代码。
