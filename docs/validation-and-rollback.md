@@ -40,6 +40,8 @@ git switch --detach rollback/pre-mineru-improvements-20260908
 
 1. `2d27364`：配置保存与界面。
 2. `39b8f57`：官网解析与 PDF 拆分。
-3. `Preserve document structure and resume validated translations`：质量与续跑，包含验收发现的解析和界面补充修正。
+3. `555bd64`：质量与续跑，包含验收发现的解析和界面补充修正。
+
+后续 `Handle Chinese CLI output on non-Chinese Windows` 提交修复了 CI 暴露的命令行编码问题：英文 Windows 的重定向输出默认 cp1252，打印中文路径可能失败；CLI 现使用 UTF-8，回归测试显式模拟旧编码验证。撤销全部功能时先撤销此修复，再撤销上述三个功能提交。
 
 若希望在 `main` 撤销某项改动且保留历史，可查看 `git log --oneline`，使用 `git revert <提交号>` 创建撤销提交，再 `git push origin main`。阶段之间存在依赖；撤销全部功能时按最新功能提交、`39b8f57`、`2d27364` 的顺序逐个撤销，并运行测试。避免只撤销底层配置或解析模块而保留依赖它的代码。

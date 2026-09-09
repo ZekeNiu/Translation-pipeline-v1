@@ -993,6 +993,10 @@ def build_arg_parser():
 
 
 def main(argv=None):
+    # Redirected streams on non-Chinese Windows can otherwise use cp1252.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     args = build_arg_parser().parse_args(argv)
     md, _ = run(
         args.input_folder,

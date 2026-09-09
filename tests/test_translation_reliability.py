@@ -152,8 +152,13 @@ class TranslationTests(unittest.TestCase):
 
 class JobTests(unittest.TestCase):
     def test_cli_returns_failure_status_for_partial_output(self):
-        with patch('translate.run', return_value=(Path('out/translated.md'), None)), patch('translate.read_json', return_value={'status': 'partial_failed'}):
-            self.assertEqual(translate.main(['input']), 1)
+        import io
+        data = io.BytesIO()
+        with io.TextIOWrapper(data, encoding='cp1252') as output:
+            with patch('translate.run', return_value=(Path('out/translated.md'), None)), patch('translate.read_json', return_value={'status': 'partial_failed'}), patch('translate.sys.stdout', output):
+                self.assertEqual(translate.main(['input']), 1)
+            output.flush()
+            self.assertIn('质量报告', data.getvalue().decode('utf-8'))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
