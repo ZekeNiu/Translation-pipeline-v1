@@ -16,3 +16,26 @@ Validation: 80 Windows regression tests pass; generated academic sample translat
 - [done] Fix date/notation false positives, selective cell retries, substage/elapsed progress, original filename fallback, and observed Word formula rendering defects.
 - [done] 88 local tests pass; live task completed 8/8, 11 tables and 29 images; no-new-request resume succeeds; Word/PDF visual check performed.
 - [done] Fix branch published; GitHub Windows Python 3.11/3.14 tests pass (run 34319874773); merge and remote verification recorded in the delivery response.
+
+## Follow-up: local MinerU GPU deployment (2026-09-09)
+
+Goal: deploy the current official MinerU GPU release on Windows using the Conda installation at `D:\Application\Anaconda`, preferring an isolated install rooted at `D:\Application\MinerU-Local` when officially supportable.
+
+1. [done] Verify current official installation guidance, Windows/GPU constraints, and the referenced tutorial; inspect local GPU, driver, Conda, Python, disk, and existing MinerU state.
+2. [done] Choose and record the least-fragile Windows deployment architecture and exact pinned environment/model locations.
+3. [done] Create the isolated environment and install the official current MinerU GPU package without modifying unrelated environments.
+4. [done] Configure model/cache paths under the preferred install root and obtain required model files through an official/recommended route.
+5. [done] Run package, GPU-backend, CLI, Web UI, and representative PDF smoke tests; record versions and recovery commands.
+6. [done] Deliver a local run/upgrade/resume guide and leave an idempotent checkpoint script and durable state record.
+
+Safety/recovery rules: never delete or overwrite an existing environment without explicit need; inspect before each mutation; log commands, versions, paths, errors, and verification results in `progress.md`; resume from observed state rather than blindly rerunning installation.
+
+## Follow-up: local CLI integration and project review (2026-09-15)
+- [in progress] Inspect existing deployment and reproduce CLI discovery failure.
+- [pending] Apply a scoped CLI integration fix and run regression plus local PDF smoke checks.
+- [pending] Deliver prioritized project recommendations grounded in code and official reference projects; do not implement review suggestions.
+
+### Acceptance (2026-09-15)
+- [done] Reproduced missing CLI and missing prefix configuration; found both the old and intended MinerU installations.
+- [done] Scoped fix, explicit 3.4.5 GUI configuration with backup, 90 regression tests, two-page live parse, GUI reload and no-process cache resume verified.
+- [done] Code review and official reference research completed; recommendations delivered only as advice.

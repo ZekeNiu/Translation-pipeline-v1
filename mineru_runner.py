@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -51,8 +52,9 @@ def _timestamped_output_dir(input_path: Path, output_root: Path | None = None) -
 
 def _resolve_executable(executable: str | None = None) -> tuple[str | None, str]:
     if executable:
+        executable = executable.strip().strip('"')
         candidate = Path(executable).expanduser()
-        if candidate.exists():
+        if candidate.is_file():
             return str(candidate), candidate.name.lower()
         found = shutil.which(executable)
         return found, Path(executable).name.lower()
@@ -60,19 +62,51 @@ def _resolve_executable(executable: str | None = None) -> tuple[str | None, str]
         found = shutil.which(command)
         if found:
             return found, command
+    # Prefix environments need not be active or installed below Anaconda/envs.
+    registry = Path.home() / ".conda" / "environments.txt"
+    try:
+        prefixes = registry.read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeError):
+        prefixes = []
+    for prefix in prefixes:
+        if not prefix.strip():
+            continue
+        for relative in ("Scripts/mineru.exe", "bin/mineru", "Scripts/magic-pdf.exe", "bin/magic-pdf"):
+            candidate = Path(prefix.strip()).expanduser() / relative
+            if candidate.is_file():
+                return str(candidate), candidate.stem.lower()
     return None, ""
+
+
+def _cli_environment(executable: str) -> dict[str, str]:
+    """Apply the selected prefix's saved settings without changing the GUI process."""
+    env = os.environ.copy()
+    prefix = Path(executable).resolve().parent.parent
+    metadata = prefix / "conda-meta"
+    if metadata.is_dir():
+        state = read_json(metadata / "state", {})
+        variables = state.get("env_vars", {}) if isinstance(state, dict) else {}
+        if isinstance(variables, dict):
+            env.update({k: v for k, v in variables.items() if isinstance(v, str)})
+        paths = ([prefix, prefix / "Library" / "mingw-w64" / "bin", prefix / "Library" / "usr" / "bin",
+                  prefix / "Library" / "bin", prefix / "Scripts", prefix / "bin"] if os.name == "nt" else [prefix / "bin"])
+        env["PATH"] = os.pathsep.join([*(str(p) for p in paths), env.get("PATH", "")])
+        env["CONDA_PREFIX"] = str(prefix)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def detect_mineru_cli(executable: str | None = None) -> MinerUDetection:
     path, command = _resolve_executable(executable)
     if not path:
-        return MinerUDetection(False, command=command, error="MinerU CLI not found in PATH.")
+        return MinerUDetection(False, command=command, error="MinerU CLI not found. 请在高级设置填写 mineru.exe 的完整路径；已检查 PATH 和已登记的 Conda 环境。")
     try:
         proc = subprocess.run(
             [path, "--version"],
             capture_output=True,
             text=True,
-            timeout=20,
+            encoding="utf-8", errors="replace", env=_cli_environment(path),
+            timeout=60,
             check=False,
         )
         version = (proc.stdout or proc.stderr).strip()
@@ -124,6 +158,7 @@ def parse_with_local_cli(
     result_dir = out_dir / "result"
     result_dir.mkdir(exist_ok=True)
     if progress:
+        progress(f"MinerU 程序：{exe_path}")
         progress(f"🔎 MinerU local parse output: {out_dir}")
 
     if command_name == "magic-pdf" or Path(exe_path).name.lower().startswith("magic-pdf"):
@@ -133,11 +168,12 @@ def parse_with_local_cli(
         if backend and backend != "auto":
             cmd.extend(["-b", backend])
 
+    env = _cli_environment(exe_path)
     if cancel_event is None:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=timeout, check=False)
     else:
         with (out_dir / "cli_stdout.txt").open("w", encoding="utf-8") as stdout, (out_dir / "cli_stderr.txt").open("w", encoding="utf-8") as stderr:
-            child = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            child = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             started = time.monotonic()
             try:
                 while child.poll() is None:

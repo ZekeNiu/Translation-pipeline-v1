@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,45 @@ import mineru_runner
 
 
 class MinerURunnerTests(unittest.TestCase):
+    def test_discovers_registered_conda_environment_outside_path(self):
+        with tempfile.TemporaryDirectory() as td, patch("mineru_runner.shutil.which", return_value=None), patch("mineru_runner.Path.home", return_value=Path(td)):
+            root = Path(td)
+            exe = root / "custom installation" / "env" / "Scripts" / "mineru.exe"
+            exe.parent.mkdir(parents=True)
+            exe.touch()
+            (root / ".conda").mkdir()
+            (root / ".conda" / "environments.txt").write_text(str(exe.parent.parent) + "\n", encoding="utf-8")
+            self.assertEqual(mineru_runner._resolve_executable()[0], str(exe))
+            # A typo in an explicit selection must not silently select another install.
+            self.assertIsNone(mineru_runner._resolve_executable(str(root / "missing.exe"))[0])
+
+    def test_conda_model_settings_reach_detection_and_parser(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exe = root / "env" / "Scripts" / "mineru.exe"
+            exe.parent.mkdir(parents=True)
+            exe.touch()
+            metadata = exe.parent.parent / "conda-meta"
+            metadata.mkdir()
+            variables = {"MINERU_MODEL_SOURCE": "local", "MINERU_TOOLS_CONFIG_JSON": str(root / "mineru.json")}
+            (metadata / "state").write_text(json.dumps({"env_vars": variables}), encoding="utf-8")
+            source = root / "paper.pdf"
+            source.write_bytes(b"%PDF")
+            original = dict(os.environ)
+            def fake_run(cmd, **kwargs):
+                for key, value in variables.items():
+                    self.assertEqual(kwargs["env"][key], value)
+                self.assertEqual(kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+                self.assertIn(str(exe.parent), kwargs["env"]["PATH"].split(os.pathsep))
+                if "-o" in cmd:
+                    (Path(cmd[cmd.index("-o") + 1]) / "full.md").write_text("# Parsed", encoding="utf-8")
+                return mineru_runner.subprocess.CompletedProcess(cmd, 0, "mineru 3.4.5", "")
+            with patch("mineru_runner.subprocess.run", side_effect=fake_run):
+                self.assertTrue(mineru_runner.detect_mineru_cli(str(exe)).found)
+                folder = mineru_runner.parse_with_local_cli(source, output_root=root / "out", executable=str(exe))
+                self.assertTrue((folder / "full.md").is_file())
+            self.assertEqual(dict(os.environ), original)
+
     def test_locate_output_prefers_full_md(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -20,7 +60,7 @@ class MinerURunnerTests(unittest.TestCase):
     def test_local_cli_uses_pipeline_backend_when_requested(self):
         calls = []
 
-        def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False, **kwargs):
             calls.append(cmd)
             out_dir = Path(cmd[cmd.index("-o") + 1])
             (out_dir / "result").mkdir(parents=True)

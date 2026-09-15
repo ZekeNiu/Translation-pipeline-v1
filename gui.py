@@ -214,7 +214,7 @@ class App:
         path = self.vars["mineru_exe"].get().strip() or None
         def task():
             info = detect_mineru_cli(path)
-            self.events.put(("notice", f"MinerU: {info.path} {info.version}" if info.found else "未检测到 MinerU，请在高级设置填写程序路径。"))
+            self.events.put(("notice", f"MinerU: {info.path} {info.version}" if info.found else f"MinerU 检测失败：{info.path or path or ''}\n{info.error}"))
         threading.Thread(target=task, daemon=True).start()
 
     def _prepare_mineru_folder(self, opts, progress_cb):
