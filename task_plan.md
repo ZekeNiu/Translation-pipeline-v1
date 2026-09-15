@@ -42,14 +42,14 @@ Safety/recovery rules: never delete or overwrite an existing environment without
 
 ## High-priority implementation (approved 2026-09-15)
 1. [done] Publish verified local CLI baseline and rollback/pre-high-priority-20260915 (517df3e).
-2. [in progress] Local parse progress, process-tree cancellation, validated version/model cache and locking.
-3. [pending] Two-level opt-in glossary, selective cache invalidation, management/extraction UI and cost metrics.
-4. [pending] Persisted source/translation alignment, manual revisions, targeted retry and review window.
-5. [pending] Regression/live/UI verification, Windows CI, staged publication, main merge and release tag.
+2. [done] Local parse progress, process-tree cancellation, validated version/model cache and locking.
+3. [done] Two-level opt-in glossary, selective cache invalidation, management/extraction UI and cost metrics.
+4. [done] Persisted source/translation alignment, manual revisions, targeted retry and review window.
+5. [done] Regression/live/UI verification, Windows CI, staged publication, main merge and release tag.
 Defaults: global/book independently off, book overrides global, manual/imported terms with explicit extraction; no full-book review or native Word equation work.
 
 ## High-priority implementation acceptance
 - [done] Observable local parsing, model/version cache validation and process-tree cancellation.
 - [done] Two-level opt-in glossary, bounded explicit extraction, selective cache behavior and management UI.
 - [done] Persisted source/translation alignment, reversible edits, targeted retry, offline recovery and review UI.
-- [in progress] Final Windows CI, versioned publication and remote verification; local 117 tests and live/visual acceptance passed.
+- [done] Final functional code passed both Windows CI versions (117 tests); release 8c88eff merged to main, tagged release/high-priority-20260915 and verified remotely. Rollback tag points to 517df3e. Subsequent commits only record this publication audit.
