@@ -54,3 +54,9 @@
 - Stage 3: durable block/cell alignment, conservative source-page matching, reversible manual edits, targeted candidate translation, offline recovery, export retry and bilingual desktop review implemented; 11 focused review tests pass.
 - CI exposed Windows short-path versus resolved long-path differences in local parser returns and a test assertion. Normalized parser output roots and made the PATH test compare resolved paths. No parser cache corruption or environment configuration failure was involved.
 - Local Python 3.11 lacked dependencies; created a separate ignored validation environment under tests/.artifacts and installed only project requirements.
+- Acceptance: 117 tests pass locally on Windows Python 3.11 and 3.14, including GUI geometry/read-only checks and actual Windows descendant-process cancellation. CI for stage 3 passed both versions (run 34960684212).
+- Live local MinerU 3.4.5: two-page parse succeeded with continuous activity/page events; no-process cache resume succeeded.
+- Live DeepSeek synthetic sample: disabled/enabled both completed in 2 requests, 0 retries; input tokens 1060/1106; wall times 17.12/18.29 s. No claim of general cost savings.
+- Live explicit extraction exposed whole-sentence candidates yielding no usable terms. Added local stop-word/punctuation bounded n-grams; revalidation produced technical candidates including oxygen concentration and recovery period. Suggestions remain opt-in and require selection.
+- Live targeted paragraph proposal/adoption and no-model export retry succeeded. Main/glossary/review windows visually checked using window capture; fixed cropped review controls and formula-related false review warnings. Word/PDF export visually checked.
+- Initial screen-region captures were black in this desktop state; window-specific capture worked. Optional win32gui probe was unavailable; Pillow's existing window capture avoided installing another dependency.

@@ -18,9 +18,11 @@ class ReviewWindow:
         self.window = tk.Toplevel(parent)
         self.window.title('原文 — 译文复核')
         self.window.geometry('1150x720')
+        self.window.minsize(920, 620)
         self.events, self.working = queue.Queue(), False
         self.document, self.edits, self.units = None, None, []
         self.current = None
+        self.displayed_text = ''
         self.controls = []
         top = ttk.Frame(self.window, padding=10)
         top.pack(fill='x')
@@ -29,19 +31,24 @@ class ReviewWindow:
         ttk.Button(top, text='刷新', command=self.load).pack(side='left', padx=6)
         self.status = ttk.Label(top, text='')
         self.status.pack(side='left', padx=12)
-        self.tree = ttk.Treeview(self.window, columns=('section', 'page', 'kind', 'issue'), show='headings', height=9, selectmode='browse')
+        listing = ttk.Frame(self.window)
+        listing.pack(fill='x', padx=10)
+        self.tree = ttk.Treeview(listing, columns=('section', 'page', 'kind', 'issue'), show='headings', height=8, selectmode='browse')
         for key, label, width in (('section', '章节 / 内容', 330), ('page', '原页码', 90), ('kind', '类型', 90), ('issue', '检查项', 540)):
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width)
-        self.tree.pack(fill='x', padx=10)
+        scrollbar = ttk.Scrollbar(listing, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right', fill='y')
+        self.tree.pack(side='left', fill='x', expand=True)
         self.tree.bind('<<TreeviewSelect>>', self.select)
         panels = ttk.Panedwindow(self.window, orient='horizontal')
         panels.pack(fill='both', expand=True, padx=10, pady=10)
         left, right = ttk.LabelFrame(panels, text='原文'), ttk.LabelFrame(panels, text='译文 / 重译候选（点击保存后采用）')
         panels.add(left, weight=1)
         panels.add(right, weight=1)
-        self.source = scrolledtext.ScrolledText(left, wrap='word', font=('Microsoft YaHei UI', 11), state='disabled')
-        self.target = scrolledtext.ScrolledText(right, wrap='word', font=('Microsoft YaHei UI', 11))
+        self.source = scrolledtext.ScrolledText(left, wrap='word', font=('Microsoft YaHei UI', 11), height=10, width=40, state='disabled')
+        self.target = scrolledtext.ScrolledText(right, wrap='word', font=('Microsoft YaHei UI', 11), height=10, width=40)
         self.source.pack(fill='both', expand=True)
         self.target.pack(fill='both', expand=True)
         self.reason = ttk.Label(self.window, text='', wraplength=1100)
@@ -101,6 +108,10 @@ class ReviewWindow:
         selection = self.tree.selection()
         if not selection or self.working:
             return
+        if self.current and self.current != selection[0] and self.target.get('1.0', 'end-1c') != self.displayed_text:
+            if not messagebox.askyesno('尚未保存', '当前译文有未保存的修改。放弃修改并切换？', parent=self.window):
+                self.tree.selection_set(self.current)
+                return
         self.current = selection[0]
         unit = next(u for u in self.units if u['id'] == self.current)
         self.source.configure(state='normal')
@@ -110,6 +121,7 @@ class ReviewWindow:
         self.target.configure(state='normal')
         self.target.delete('1.0', 'end')
         self.target.insert('1.0', effective_text(unit, self.edits))
+        self.displayed_text = effective_text(unit, self.edits)
         self.reason.configure(text='；'.join(self.issues(unit)) or '自动检查未发现问题；仍需结合原文判断语义。')
 
     def selected(self):
@@ -207,5 +219,8 @@ class ReviewWindow:
         if self.working:
             self.status.configure(text='请等待当前操作结束后关闭。')
             return
+        if self.current and self.target.get('1.0', 'end-1c') != self.displayed_text:
+            if not messagebox.askyesno('尚未保存', '当前译文有未保存的修改。放弃修改并关闭？', parent=self.window):
+                return
         self.window.after_cancel(self.timer)
         self.window.destroy()

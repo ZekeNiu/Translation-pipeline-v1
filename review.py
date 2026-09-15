@@ -22,6 +22,13 @@ from translation_checks import concerns
 READONLY = {'reference', 'code', 'formula', 'image', 'unmapped'}
 
 
+def text_issues(source, translated):
+    from translate import protect_fragments, find_untranslated_english
+    original, _ = protect_fragments(source)
+    candidate, _ = protect_fragments(translated)
+    return concerns(original, candidate) + find_untranslated_english(candidate)
+
+
 def all_units(document):
     for segment in document['segments']:
         for unit in segment['units']:
@@ -115,10 +122,13 @@ def make_document(state, segments, translations, chapters, sidecar, source_info,
         alignment = deepcopy(record.get('alignment', []))
         if not alignment:
             alignment = [{'source': source, 'translated': translated, 'kind': 'unmapped'}]
+        current_chapter = chapters[index]
         for i, unit in enumerate(alignment):
-            unit.update(id=f'{seg_id}:b{i}', chapter=chapters[index], segment=index + 1,
+            if unit['kind'] == 'heading' and re.match(r'^#{1,3}\s', unit['source']):
+                current_chapter = unit['source']
+            unit.update(id=f'{seg_id}:b{i}', chapter=current_chapter, segment=index + 1,
                         page=None, bbox=None, source_hash=fingerprint(unit['source']))
-            unit['issues'] = concerns(unit['source'], unit['translated']) + matcher.issues(unit['source'], unit['translated']) if unit['kind'] not in READONLY else []
+            unit['issues'] = text_issues(unit['source'], unit['translated']) + matcher.issues(unit['source'], unit['translated']) if unit['kind'] not in READONLY else []
             unit['glossary_terms'] = matcher.matches(unit['source'])
             if unit['kind'] == 'unmapped':
                 unit['issues'] = ['没有可靠的原译对应记录；可尝试离线恢复，不能直接编辑此分段。']
@@ -132,9 +142,9 @@ def make_document(state, segments, translations, chapters, sidecar, source_info,
                 if shape(originals) == shape(results) and len(left) == len(right):
                     for j, (src, dst) in enumerate(zip(left, right)):
                         unit['cells'].append({'id': f"{unit['id']}:c{j}", 'kind': 'cell', 'source': src.text,
-                            'translated': dst.text, 'chapter': chapters[index], 'segment': index + 1,
+                            'translated': dst.text, 'chapter': current_chapter, 'segment': index + 1,
                             'source_hash': fingerprint(src.text), 'page': None, 'bbox': None,
-                            'issues': concerns(src.text, dst.text) + matcher.issues(src.text, dst.text),
+                            'issues': text_issues(src.text, dst.text) + matcher.issues(src.text, dst.text),
                             'glossary_terms': matcher.matches(src.text)})
                 else:
                     unit['issues'].append('表格结构不能可靠对应，单元格编辑不可用。')
@@ -232,7 +242,7 @@ def validate_edit(unit, text):
         raise ValueError('标题层级不能在复核中改变。')
     if len(blocks(text)) != 1 or (unit['kind'] == 'cell' and re.search(r'</?(?:table|tr|td|th)\b', text, re.I)):
         raise ValueError('请保持当前段落或单元格结构，不要插入新段落或表格。')
-    return concerns(unit['source'], text)
+    return concerns(original, candidate)
 
 
 def backup_artifacts(out):

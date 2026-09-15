@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from glossary import GlossaryMatcher, GlossarySnapshot, GlossaryStore, book_identity, merge_entries, read_csv, write_csv, extract_candidates
+from glossary import GlossaryMatcher, GlossarySnapshot, GlossaryStore, book_identity, merge_entries, read_csv, write_csv, extract_candidates, local_candidates
 import translate
 from task_state import read_json
 
@@ -20,6 +20,12 @@ def snapshot(*entries):
 
 
 class GlossaryTests(unittest.TestCase):
+    def test_local_candidates_stop_at_function_words(self):
+        candidates = local_candidates('Oxygen concentration is denoted by O2. The recovery period was 2 min.')
+        self.assertIn('Oxygen concentration', candidates)
+        self.assertIn('recovery period', candidates)
+        self.assertNotIn('Oxygen concentration is denoted by', candidates)
+
     def test_priority_boundaries_and_longest_phrase(self):
         matcher = GlossaryMatcher(GlossarySnapshot(True, True,
             (entry('force', '力'), entry('force plate', '测力台'), entry('Force', '力量')),

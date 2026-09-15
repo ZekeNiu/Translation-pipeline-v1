@@ -102,6 +102,9 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
         state = read_json(state_path, {})
         if not isinstance(state, dict):
             state = {}
+        if state.get('identity') and not state.get('review_version'):
+            from review import backup_artifacts
+            backup_artifacts(out)
         if state.get("identity") != identity:
             # Preserve prior explicit-directory artifacts before adopting a different source/configuration.
             if state.get("identity"):
@@ -111,6 +114,7 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
                     if (out / name).is_file():
                         shutil.copy2(out / name, previous / name)
             state = {"version": 3, "identity": identity, "source_hash": document_hash, "config_hash": config_hash, "segments": {}}
+        state['review_version'] = 1
         if state.get("checks_version") != 2:
             # Revalidate raw cached responses when rules change; no need to retranslate them.
             state["segments"] = {}

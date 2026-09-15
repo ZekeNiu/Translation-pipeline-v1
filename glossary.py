@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
 from dataclasses import dataclass, replace
 import html
 import io
@@ -179,11 +180,39 @@ class GlossaryStore:
         return GlossarySnapshot.from_dict({'book_id': book_id, **book, 'global_entries': common['entries'], 'book_entries': book['entries']})
 
 
+def local_candidates(text, limit=100):
+    """Bounded n-grams split at function words and punctuation, not whole sentences."""
+    stop = set('a an the this that these those is are was were be been being of to in on at by for from with without and or but as into than then it its their our your we they he she which who what when where how not no used using use same must should can could would may might will shall each all both only also some other such have has had do does did'.split())
+    counts, spellings = Counter(), {}
+    run = []
+    def collect():
+        for i in range(len(run)):
+            for length in range(1, min(4, len(run) - i) + 1):
+                start, end = run[i].start(), run[i + length - 1].end()
+                term = text[start:end]
+                if length == 1 and len(term) < 4 and not term.isupper():
+                    continue
+                key = term_key(term)
+                counts[key] += 1
+                spellings.setdefault(key, term)
+    previous_end = None
+    for match in re.finditer(r'[A-Za-z]+(?:-[A-Za-z]+)*', text):
+        if match[0].casefold() in stop or (previous_end is not None and re.search(r'[^ \t]', text[previous_end:match.start()])):
+            collect()
+            run = []
+        if match[0].casefold() not in stop:
+            run.append(match)
+        previous_end = match.end()
+    collect()
+    ordered = sorted(counts, key=lambda k: (-(counts[k] > 1), -(len(k.split()) > 1), -counts[k], -len(k.split()), k))
+    return [spellings[k] for k in ordered[:limit]]
+
+
 def extract_candidates(source, config):
     """Explicit operation: bounded candidate/context request, never auto-applied."""
     import translate
     text = visible_text(source)
-    candidates = translate.extract_term_audit_candidates(text, limit=100)
+    candidates = local_candidates(text, limit=100)
     snippets, used = [], 0
     for term in candidates:
         match = re.search(re.escape(term), text, re.I)

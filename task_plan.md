@@ -47,3 +47,9 @@ Safety/recovery rules: never delete or overwrite an existing environment without
 4. [pending] Persisted source/translation alignment, manual revisions, targeted retry and review window.
 5. [pending] Regression/live/UI verification, Windows CI, staged publication, main merge and release tag.
 Defaults: global/book independently off, book overrides global, manual/imported terms with explicit extraction; no full-book review or native Word equation work.
+
+## High-priority implementation acceptance
+- [done] Observable local parsing, model/version cache validation and process-tree cancellation.
+- [done] Two-level opt-in glossary, bounded explicit extraction, selective cache behavior and management UI.
+- [done] Persisted source/translation alignment, reversible edits, targeted retry, offline recovery and review UI.
+- [in progress] Final Windows CI, versioned publication and remote verification; local 117 tests and live/visual acceptance passed.

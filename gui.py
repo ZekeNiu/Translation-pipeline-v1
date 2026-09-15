@@ -227,7 +227,12 @@ class App:
         common = {"output_root": opts["mineru_output"] or None, "progress": emit, "cancel_event": self.cancel_event}
         if opts["source_mode"] == SOURCE_LOCAL_CLI:
             return str(parse_with_local_cli(opts["input_path"], executable=opts["mineru_exe"] or None, backend=opts["mineru_backend"], **common))
-        return str(parse_with_api(opts["input_path"], base_url=opts["mineru_url"], api_key=opts["mineru_key"] or None, **common))
+        folder = parse_with_api(opts["input_path"], base_url=opts["mineru_url"], api_key=opts["mineru_key"] or None, **common)
+        from task_state import write_json, file_hash
+        origin = Path(folder) / 'source_document.json'
+        if not origin.exists():
+            write_json(origin, {'version': 1, 'path': str(Path(opts['input_path']).resolve()), 'hash': file_hash(Path(opts['input_path']))})
+        return str(folder)
 
     def _run(self):
         if self.running or self.auxiliary_busy:
