@@ -42,7 +42,9 @@ class MinerURunnerTests(unittest.TestCase):
                 if "-o" in cmd:
                     (Path(cmd[cmd.index("-o") + 1]) / "full.md").write_text("# Parsed", encoding="utf-8")
                 return mineru_runner.subprocess.CompletedProcess(cmd, 0, "mineru 3.4.5", "")
-            with patch("mineru_runner.subprocess.run", side_effect=fake_run):
+            def observed(cmd, directory, env, *args):
+                return fake_run(cmd, env=env)
+            with patch("mineru_runner.subprocess.run", side_effect=fake_run), patch("mineru_runner.run_observed", side_effect=observed):
                 self.assertTrue(mineru_runner.detect_mineru_cli(str(exe)).found)
                 folder = mineru_runner.parse_with_local_cli(source, output_root=root / "out", executable=str(exe))
                 self.assertTrue((folder / "full.md").is_file())
@@ -60,7 +62,7 @@ class MinerURunnerTests(unittest.TestCase):
     def test_local_cli_uses_pipeline_backend_when_requested(self):
         calls = []
 
-        def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False, **kwargs):
+        def fake_run(cmd, *args, **kwargs):
             calls.append(cmd)
             out_dir = Path(cmd[cmd.index("-o") + 1])
             (out_dir / "result").mkdir(parents=True)
@@ -74,8 +76,8 @@ class MinerURunnerTests(unittest.TestCase):
             return Result()
 
         with tempfile.TemporaryDirectory() as td, patch("mineru_runner._resolve_executable", return_value=("mineru", "mineru")), patch(
-            "mineru_runner.subprocess.run", fake_run
-        ):
+            "mineru_runner.run_observed", fake_run
+        ), patch("mineru_runner.parser_signature", return_value=({"engine": "test"}, True)):
             source = Path(td) / "paper.pdf"
             source.write_bytes(b"%PDF")
             folder = mineru_runner.parse_with_local_cli(source, output_root=Path(td) / "out", backend="pipeline")

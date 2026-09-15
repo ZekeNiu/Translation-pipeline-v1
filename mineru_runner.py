@@ -11,7 +11,9 @@ import time
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 import zipfile
-from task_state import check_cancel, TaskCancelled, file_hash, fingerprint, read_json, write_json
+import uuid
+from local_parse import parser_signature, run_observed
+from task_state import check_cancel, TaskCancelled, file_hash, fingerprint, read_json, write_json, task_lock
 from mineru_merge import safe_extract, result_fingerprint, result_valid
 
 
@@ -149,55 +151,51 @@ def parse_with_local_cli(
         raise MinerURunnerError("MinerU CLI was not found. Install MinerU or set the executable path.")
 
     root = Path(output_root) if output_root else DEFAULT_MINERU_OUTPUT_ROOT
-    identity = fingerprint(file_hash(source), str(exe_path), backend) if source.is_file() else None
-    out_dir = root / f"local_{identity[:20]}" if identity else _timestamped_output_dir(source, root)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache = read_json(out_dir / "local_state.json", {})
-    if result_valid(cache):
-        return locate_mineru_output_folder(cache["result_dir"])
-    result_dir = out_dir / "result"
-    result_dir.mkdir(exist_ok=True)
-    if progress:
-        progress(f"MinerU 程序：{exe_path}")
-        progress(f"🔎 MinerU local parse output: {out_dir}")
-
-    if command_name == "magic-pdf" or Path(exe_path).name.lower().startswith("magic-pdf"):
-        cmd = [exe_path, "-p", str(source), "-o", str(result_dir)]
-    else:
-        cmd = [exe_path, "-p", str(source), "-o", str(result_dir)]
-        if backend and backend != "auto":
+    source_hash = file_hash(source) if source.is_file() else fingerprint([
+        (p.relative_to(source).as_posix(), file_hash(p)) for p in sorted(source.rglob("*")) if p.is_file()])
+    identity = fingerprint(source_hash, str(Path(exe_path).resolve()), backend or "auto")
+    out_dir = root / f"local_v2_{identity[:20]}"
+    with task_lock(out_dir):
+        check_cancel(cancel_event)
+        if progress:
+            progress({"msg": f"检查 MinerU 版本与本地模型：{exe_path}", "stage": "parse"})
+        env = _cli_environment(exe_path)
+        signature, reusable = parser_signature(exe_path, backend, env, detect_mineru_cli)
+        cache = read_json(out_dir / "local_state.json", {})
+        if reusable and cache.get("signature") == signature and result_valid(cache):
+            if progress:
+                progress({"msg": "MinerU：版本、模型与结果校验通过，复用已完成解析。", "stage": "parse"})
+            return locate_mineru_output_folder(cache["result_dir"])
+        if progress:
+            reason = "解析版本或配置已变化，重新解析。" if reusable else "无法完整验证本地模型版本，本次重新解析。"
+            progress({"msg": "MinerU：" + reason, "stage": "parse"})
+        attempt = out_dir / ("attempt_" + uuid.uuid4().hex[:12])
+        result_dir = attempt / "result"
+        result_dir.mkdir(parents=True)
+        cmd = [exe_path, "-p", str(source.resolve()), "-o", str(result_dir.resolve())]
+        if not Path(exe_path).name.lower().startswith("magic-pdf") and backend and backend != "auto":
             cmd.extend(["-b", backend])
+        try:
+            proc = run_observed(cmd, attempt, env, timeout, progress, cancel_event)
+        except TimeoutError as exc:
+            raise MinerURunnerError(str(exc)) from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[-6000:]
+            raise MinerURunnerError(f"MinerU CLI failed with exit code {proc.returncode}: {detail}\n日志：{attempt}")
+        check_cancel(cancel_event)
+        folder = locate_mineru_output_folder(result_dir)
+        write_json(out_dir / "local_state.json", {"version": 2, "signature": signature,
+                   "source": str(source.resolve()), "source_hash": source_hash,
+                   "result_dir": str(result_dir.resolve()), "result_hashes": result_fingerprint(result_dir)})
+        write_json(folder / "source_document.json", {"version": 1, "path": str(source.resolve()), "hash": source_hash})
+        # The source record is also included in subsequent integrity checks.
+        cache = read_json(out_dir / "local_state.json")
+        cache["result_hashes"] = result_fingerprint(result_dir)
+        write_json(out_dir / "local_state.json", cache)
+        if progress:
+            progress({"msg": "MinerU：解析完成。", "stage": "parse"})
+        return folder
 
-    env = _cli_environment(exe_path)
-    if cancel_event is None:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=timeout, check=False)
-    else:
-        with (out_dir / "cli_stdout.txt").open("w", encoding="utf-8") as stdout, (out_dir / "cli_stderr.txt").open("w", encoding="utf-8") as stderr:
-            child = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            started = time.monotonic()
-            try:
-                while child.poll() is None:
-                    if cancel_event.wait(0.2):
-                        check_cancel(cancel_event)
-                    if timeout is not None and time.monotonic() - started > timeout:
-                        raise MinerURunnerError("本地 MinerU 解析超时，已保留文件。")
-            except BaseException:
-                child.terminate()
-                try:
-                    child.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.wait()
-                raise
-        proc = subprocess.CompletedProcess(cmd, child.returncode,
-                                           (out_dir / "cli_stdout.txt").read_text(encoding="utf-8", errors="replace"),
-                                           (out_dir / "cli_stderr.txt").read_text(encoding="utf-8", errors="replace"))
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        raise MinerURunnerError(f"MinerU CLI failed with exit code {proc.returncode}: {detail}")
-    folder = locate_mineru_output_folder(result_dir)
-    write_json(out_dir / "local_state.json", {"result_dir": str(result_dir.resolve()), "result_hashes": result_fingerprint(result_dir)})
-    return folder
 
 
 def _auth_headers(api_key: str | None) -> dict[str, str]:

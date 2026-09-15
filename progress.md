@@ -47,3 +47,5 @@
 - Reopened hidden GUI restored the selected executable. Cache resume succeeded with subprocess launch forbidden. No translation API calls were used in this acceptance.
 - Full regression: 90 tests pass; git diff --check passes. README documents CLI discovery/configuration. Local settings backup: %LOCALAPPDATA%\TranslationPipeline\settings.before-mineru-20260915.json.
 - Project recommendations remain unimplemented; code changes only address CLI discovery, selected environment propagation, text encoding and detection diagnostics.
+- Stage 1: implemented live UTF-8 log observation, page progress, task-owned process-tree shutdown, metadata/model-aware cache checks, parser lock, fresh attempt directories and original-source records.
+- Focused regression found a test locking the output parent instead of the actual job directory; corrected test path (implementation lock behavior passes).

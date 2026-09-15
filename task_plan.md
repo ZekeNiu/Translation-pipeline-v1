@@ -39,3 +39,11 @@ Safety/recovery rules: never delete or overwrite an existing environment without
 - [done] Reproduced missing CLI and missing prefix configuration; found both the old and intended MinerU installations.
 - [done] Scoped fix, explicit 3.4.5 GUI configuration with backup, 90 regression tests, two-page live parse, GUI reload and no-process cache resume verified.
 - [done] Code review and official reference research completed; recommendations delivered only as advice.
+
+## High-priority implementation (approved 2026-09-15)
+1. [done] Publish verified local CLI baseline and rollback/pre-high-priority-20260915 (517df3e).
+2. [in progress] Local parse progress, process-tree cancellation, validated version/model cache and locking.
+3. [pending] Two-level opt-in glossary, selective cache invalidation, management/extraction UI and cost metrics.
+4. [pending] Persisted source/translation alignment, manual revisions, targeted retry and review window.
+5. [pending] Regression/live/UI verification, Windows CI, staged publication, main merge and release tag.
+Defaults: global/book independently off, book overrides global, manual/imported terms with explicit extraction; no full-book review or native Word equation work.
