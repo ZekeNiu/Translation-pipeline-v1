@@ -60,3 +60,4 @@
 - Live explicit extraction exposed whole-sentence candidates yielding no usable terms. Added local stop-word/punctuation bounded n-grams; revalidation produced technical candidates including oxygen concentration and recovery period. Suggestions remain opt-in and require selection.
 - Live targeted paragraph proposal/adoption and no-model export retry succeeded. Main/glossary/review windows visually checked using window capture; fixed cropped review controls and formula-related false review warnings. Word/PDF export visually checked.
 - Initial screen-region captures were black in this desktop state; window-specific capture worked. Optional win32gui probe was unavailable; Pillow's existing window capture avoided installing another dependency.
+- Final feature code 1c68306 passed GitHub Windows Python 3.11 and 3.14, 117 tests each (run 34961700245). Release documentation records exact live metrics, known limitations and rollback commands.
