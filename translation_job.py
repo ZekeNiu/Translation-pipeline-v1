@@ -63,7 +63,10 @@ def _copy_images(text, source, output):
 
 
 def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=None, speed_mode=None,
-            max_workers=None, cancel_event=None, parse_seconds=0):
+            max_workers=None, cancel_event=None, parse_seconds=0, glossary=None, source_info=None):
+    from glossary import GlossaryMatcher, GlossarySnapshot
+    snapshot = glossary or GlossarySnapshot()
+    config = replace(config, glossary=GlossaryMatcher(snapshot))
     check_cancel(cancel_event)
     root = Path(input_folder).resolve()
     files = sorted(root.glob("*.md"))
@@ -113,6 +116,9 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
             state["segments"] = {}
             state["checks_version"] = 2
         state.update(status="running", source=str(source), provider=config.provider_name, model=config.model)
+        write_json(out / "glossary_snapshot.json", snapshot.to_dict())
+        if source_info:
+            write_json(out / "source_document.json", source_info)
         write_json(state_path, state)
         progress(f"译文完成后保存到：{out}", stage="prepare", output_dir=str(out), artifact_ready=False)
         try:
@@ -167,6 +173,10 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     state["blocks"] = [{"id": b.id, "kind": b.kind, "source_hash": fingerprint(b.text)} for b in original_blocks]
     for i, seg_id in enumerate(ids):
         record = state["segments"].setdefault(seg_id, {})
+        effective_terms = config.glossary.matches(segments[i])
+        if record.get("glossary_terms", []) != effective_terms:
+            record["status"] = "pending"
+        record["glossary_terms"] = effective_terms
         record.update(source_hash=fingerprint(segments[i]), index=i, context_hash=fingerprint(chapters[i], excerpts[i - 1][-300:] if i else "", excerpts[i + 1][:300] if i + 1 < len(ids) else ""))
     write_json(state_path, state)
     translations = list(segments)  # Failed material remains visible in the partial artifact.
@@ -260,7 +270,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                     table_reports.extend(tables)
                     warnings.extend(issues)
                     failures = any(r["failures"] for r in tables)
-                    review = bool(issues) or any(r["residual_english"] or r["inline_artifacts"] for r in tables)
+                    review = bool(issues) or any(r["residual_english"] or r["inline_artifacts"] or r.get("glossary_warnings") for r in tables)
                     status = "failed" if failures else "needs_review" if review else "completed"
                     path = out / "_chunks" / f"{ids[index]}.md"
                     atomic_write(path, translated)
@@ -288,7 +298,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     failed = [i + 1 for i, key in enumerate(ids) if state["segments"][key].get("status") not in {"completed", "needs_review"}]
     # Valid LaTeX in Markdown is expected. Report commands that remain after Word conversion.
     artifacts = engine.find_latex_artifacts(engine.normalize_inline_output(result))
-    status = "partial_failed" if failed else "needs_review" if warnings or parse_warnings or missing_images or artifacts or any(r["residual_english"] or r["inline_artifacts"] for r in table_reports) else "completed"
+    status = "partial_failed" if failed else "needs_review" if warnings or parse_warnings or missing_images or artifacts or any(r["residual_english"] or r["inline_artifacts"] or r.get("glossary_warnings") for r in table_reports) else "completed"
     progress("正在保存译文与质量报告…", stage="export")
     atomic_write(out / "translated.md", result)
     export_started = time.monotonic()
@@ -312,10 +322,16 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
               "timings": {"parse": parse_seconds, "translation_wall": elapsed, "table_workers": table_seconds,
                           "body_workers": body_seconds, "retry_requests": sum(m["seconds"] for m in metrics if m.get("retry")),
                           "export": time.monotonic() - export_started},
-              "request_count": len(metrics), "requests": metrics, "workers": workers}
+              "request_count": len(metrics), "requests": metrics, "workers": workers,
+              "glossary": {"matched_terms": sum(len(state["segments"][key].get("glossary_terms", [])) for key in ids),
+                           "prompt_chars": sum(m.get("glossary_chars", 0) for m in metrics),
+                           "retry_requests": sum(bool(m.get("retry")) for m in metrics),
+                           "book_extraction_requests": list(config.glossary.snapshot.extraction_requests)}}
     write_json(out / "quality_report.json", report)
     lines = ["# 翻译质量报告", "", {"completed": "完成：自动检查未发现需要处理的问题。", "needs_review": "完成，但有待检查项。", "partial_failed": "部分失败；失败段落保留原文，可继续任务重试。"}[status],
              "", f"共 {len(ids)} 段；本次模型请求 {len(metrics)} 次。", "", "自动检查用于发现结构问题与疑点，不等同于人工语义审校。"]
+    lines.extend(["", f"术语命中（按分段累计）：{report['glossary']['matched_terms']}；本次请求附加术语字符：{report['glossary']['prompt_chars']}；本次修订请求：{report['glossary']['retry_requests']}。"] )
+    lines.append(f"本书累计术语提取请求：{len(config.glossary.snapshot.extraction_requests)}。服务返回的逐次用量见 JSON 报告。")
     if failed:
         lines.extend(["", "未完成段落：" + ", ".join(map(str, failed))])
         for i in failed:
@@ -330,8 +346,8 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     table_numbers = {}
     for table in table_reports:
         table_numbers[table['segment']] = table_numbers.get(table['segment'], 0) + 1
-        if table["failures"] or table["residual_english"] or table["inline_artifacts"]:
-            details = []
+        if table["failures"] or table["residual_english"] or table["inline_artifacts"] or table.get("glossary_warnings"):
+            details = list(table.get("glossary_warnings", []))
             if table['failures']:
                 details.append(f"{len(table['failures'])} 个单元格未完成")
             if table['residual_english']:

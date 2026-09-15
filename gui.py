@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, ttk
+from tkinter import filedialog, scrolledtext, ttk, messagebox
 
 from mineru_runner import DEFAULT_MINERU_OUTPUT_ROOT, detect_mineru_cli, parse_with_api, parse_with_local_cli
 from settings_store import SettingsError, SettingsStore
@@ -33,7 +33,8 @@ class App:
         self.providers = self.settings.get("providers", {})
         self.current_provider = ""
         self.events, self.cancel_event = queue.Queue(), threading.Event()
-        self.running = self.closing = False
+        self.running = self.closing = self.auxiliary_busy = False
+        self.glossary_window = None
         self.save_timer = None
         self.active_secrets, self.stage = [], ""
         self.result_dir = self.settings.get("result_dir", "")
@@ -65,6 +66,7 @@ class App:
         self.advanced_var, self.logs_var = tk.BooleanVar(), tk.BooleanVar()
         ttk.Checkbutton(toggles, text="高级设置", variable=self.advanced_var, command=self._toggle_panels).pack(side="left")
         ttk.Checkbutton(toggles, text="详细日志", variable=self.logs_var, command=self._toggle_panels).pack(side="left", padx=14)
+        ttk.Button(toggles, text="专业术语表", command=self._open_glossary).pack(side="left", padx=8)
         self.save_label = ttk.Label(toggles, text="设置自动保存到当前账户")
         self.save_label.pack(side="right")
         self.advanced_frame = self._frame(page, "高级设置", 5)
@@ -227,7 +229,7 @@ class App:
         return str(parse_with_api(opts["input_path"], base_url=opts["mineru_url"], api_key=opts["mineru_key"] or None, **common))
 
     def _run(self):
-        if self.running:
+        if self.running or self.auxiliary_busy:
             return
         opts = self._snapshot()
         path = Path(opts["input_path"])
@@ -245,6 +247,14 @@ class App:
         if error:
             self.progress_label.configure(text=error)
             return
+        from glossary import GlossaryStore, book_identity
+        from task_state import file_hash
+        try:
+            glossary = GlossaryStore().snapshot(book_identity(opts["input_path"]))
+        except Exception as exc:
+            self.progress_label.configure(text=str(exc))
+            return
+        source_info = {"version": 1, "path": str(path.resolve()), "hash": file_hash(path)} if path.is_file() else None
         self._save_settings()
         self.running = True
         secrets = self.active_secrets = [opts["api_key"], opts["mineru_key"]]
@@ -263,7 +273,7 @@ class App:
                 elapsed = time.monotonic() - started
                 check_cancel(self.cancel_event)
                 md, _docx = run(folder, opts["output_dir"] or None, **{k: opts[k] for k in ("provider", "base_url", "api_key", "model", "speed_mode")},
-                                progress_callback=progress_cb, cancel_event=self.cancel_event, parse_seconds=elapsed)
+                                progress_callback=progress_cb, cancel_event=self.cancel_event, parse_seconds=elapsed, glossary=glossary, source_info=source_info)
                 summary = read_json(Path(md).parent / "quality_report.json", {})
                 self.events.put(("done", (str(Path(md).parent), summary.get("status", "completed"))))
             except TaskCancelled as exc:
@@ -328,10 +338,39 @@ class App:
             elif event == "notice":
                 self.progress_label.configure(text=value)
                 self._log(value)
-        if self.closing and not self.running:
+        if self.closing and not self.running and not self.auxiliary_busy:
             self.root.destroy()
             return
         self.queue_timer = self.root.after(100, self._drain_queue)
+
+    def _open_glossary(self):
+        from glossary import GlossaryStore, book_identity
+        from glossary_gui import GlossaryWindow
+        if self.running or self.auxiliary_busy:
+            self.progress_label.configure(text="请等待当前任务结束后管理术语。")
+            return
+        if self.glossary_window and self.glossary_window.window.winfo_exists():
+            self.glossary_window.window.lift()
+            return
+        opts = self._snapshot()
+        try:
+            book_id = book_identity(opts["input_path"])
+            config = resolve_provider_config(**{k: opts[k] for k in ("provider", "base_url", "api_key", "model")})
+            def prepare():
+                folder = Path(self._prepare_mineru_folder(opts, lambda info: self.events.put(("progress", info))))
+                files = sorted(folder.glob("*.md"))
+                source = next((p for p in files if p.name == "full.md"), files[0])
+                return source.read_text(encoding="utf-8")
+            def busy(value):
+                self.auxiliary_busy = value
+                self.run_btn.configure(state="disabled" if value else "normal")
+                if value:
+                    self.cancel_event.clear()
+            from dataclasses import replace
+            config = replace(config, cancel_event=self.cancel_event)
+            self.glossary_window = GlossaryWindow(self.root, GlossaryStore(), book_id, prepare, config, busy)
+        except Exception as exc:
+            self.progress_label.configure(text=str(exc))
 
     def _open_result(self):
         if self.result_dir and Path(self.result_dir).is_dir():
@@ -339,7 +378,7 @@ class App:
 
     def _close(self):
         self._save_settings()
-        if self.running:
+        if self.running or self.auxiliary_busy:
             self.closing = True
             self._stop()
         else:

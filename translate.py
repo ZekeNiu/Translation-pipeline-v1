@@ -57,6 +57,8 @@ class ProviderConfig:
     phase: str = "body"
     is_retry: bool = False
     request_progress: object = field(default=None, repr=False, compare=False)
+    glossary: object = field(default=None, repr=False, compare=False)
+    glossary_prompt: str = ""
 
     def endpoint(self) -> str:
         base = self.base_url.strip().rstrip("/")
@@ -310,7 +312,7 @@ def call_chat_completion(config: ProviderConfig, messages, timeout: int | None =
             resp.close()
         if config.metrics is not None:
             config.metrics.append({"seconds": round(time.monotonic() - started, 3), "phase": config.phase,
-                                   "retry": config.is_retry, "usage": data.get("usage", {}) if isinstance(data, dict) else {}})
+                                   "retry": config.is_retry, "glossary_chars": len(config.glossary_prompt), "usage": data.get("usage", {}) if isinstance(data, dict) else {}})
     try:
         choice = data["choices"][0]
         if choice.get("finish_reason") in {"length", "content_filter"}:
@@ -633,6 +635,10 @@ class _CellValidationError(ValueError):
         self.accepted, self.invalid = accepted, invalid
 
 
+def _table_issues(config, source, translated):
+    return len(find_untranslated_table_english(TOKEN.sub("", translated))) + len(config.glossary.issues(source, translated) if config.glossary else [])
+
+
 def _translate_text_batch(
     items: list[str],
     config: ProviderConfig,
@@ -648,7 +654,9 @@ def _translate_text_batch(
         placeholder_maps.append(placeholders)
 
     payload = json.dumps(protected_items, ensure_ascii=False)
-    system_prompt = TABLE_SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "")
+    term_prompt = config.glossary.prompt("\n".join(items)) if config.glossary else ""
+    config = replace(config, glossary_prompt=term_prompt)
+    system_prompt = TABLE_SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "") + term_prompt
     check_cancel(config.cancel_event)
     key = _hash_text(config.provider_name, config.base_url, config.model, str(config.temperature), system_prompt, payload)
     cache_path = cache_dir / f"{prefix}_{key}.json"
@@ -686,11 +694,13 @@ def _translate_text_batch(
                 invalid.append(i)
         if invalid:
             raise _CellValidationError(accepted, invalid)
-        suspect = [i for i, text in enumerate(translated_items) if find_untranslated_table_english(TOKEN.sub("", text))]
+        suspect = [i for i, text in enumerate(translated_items) if find_untranslated_table_english(TOKEN.sub("", text)) or (config.glossary and config.glossary.issues(items[i], restore_placeholders(text, placeholder_maps[i])))]
         if suspect:
             try:
-                correction = call_chat_completion(replace(config, is_retry=True), [
-                    {"role": "system", "content": system_prompt + "\nCheck untranslated ordinary words carefully; preserve clear names and acronyms."},
+                retry_terms = config.glossary.prompt("\n".join(items[i] for i in suspect)) if config.glossary else ""
+                retry_system = TABLE_SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "") + retry_terms
+                correction = call_chat_completion(replace(config, is_retry=True, glossary_prompt=retry_terms), [
+                    {"role": "system", "content": retry_system + "\nCheck untranslated ordinary words carefully; preserve clear names and acronyms."},
                     {"role": "user", "content": json.dumps([protected_items[i] for i in suspect], ensure_ascii=False)},
                 ])
                 candidates = _extract_json_array(correction)
@@ -698,7 +708,7 @@ def _translate_text_batch(
                     raise ValueError("Correction length mismatch")
                 for i, candidate in zip(suspect, candidates):
                     validate_protected(protected_items[i], candidate)
-                    if numbers(protected_items[i]) == numbers(candidate) and len(find_untranslated_table_english(TOKEN.sub("", candidate))) < len(find_untranslated_table_english(TOKEN.sub("", translated_items[i]))):
+                    if numbers(protected_items[i]) == numbers(candidate) and _table_issues(config, items[i], restore_placeholders(candidate, placeholder_maps[i])) < _table_issues(config, items[i], restore_placeholders(translated_items[i], placeholder_maps[i])):
                         translated_items[i] = candidate
             except (RemoteError, ValueError, TypeError):
                 pass  # Keep the already validated first candidate.
@@ -757,7 +767,7 @@ def translate_table_cells(
     for i, item in enumerate(items):
         if not _needs_translation(item):
             continue
-        key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide, item)
+        key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide + (config.glossary.prompt(item) if config.glossary else ""), item)
         if key not in translation_memory:
             cached = _read_cache(cache_dir / f"cell_{key}.json")
             if cached is not None:
@@ -793,7 +803,7 @@ def translate_table_cells(
             failures.extend(local_failures)
         for source, value in zip(unique_values, translated):
             if not local_failures or source != value:
-                cell_key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide, source)
+                cell_key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide + (config.glossary.prompt(source) if config.glossary else ""), source)
                 translation_memory[cell_key] = value
                 _write_cache(cache_dir / f"cell_{cell_key}.json", value)
             for index in unique_indexes[source]:
@@ -848,6 +858,7 @@ def translate_tables_in_text(
             "failures": failures,
             "residual_english": quality["residual_english"],
             "inline_artifacts": quality["inline_artifacts"],
+            "glossary_warnings": [issue for src, dst in zip(source_texts, translated_texts) for issue in (config.glossary.issues(src, dst) if config.glossary else [])],
         }
         if table_reports is not None:
             table_reports.append(report)
@@ -898,7 +909,9 @@ def translate_segment(
         "Do not output SOURCE tags or any content outside the block markers.\n\n"
     )
     prompt = instruction + f"<SOURCE>\n{protected}\n</SOURCE>"
-    system_prompt = SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "")
+    term_prompt = config.glossary.prompt(protected) if config.glossary else ""
+    config = replace(config, glossary_prompt=term_prompt)
+    system_prompt = SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "") + term_prompt
     key = _hash_text("validated-v3", config.provider_name, config.base_url, config.model,
                      str(config.temperature), system_prompt, prompt, segment)
     cache_path = cache_dir / f"seg_{key}.json"
@@ -907,7 +920,7 @@ def translate_segment(
     source_pairs = re.findall(pair_pattern, protected)
 
     def block_issues(original, candidate):
-        return concerns(original, candidate) + find_untranslated_english(candidate)
+        return concerns(original, candidate) + find_untranslated_english(candidate) + (config.glossary.issues(original, candidate) if config.glossary else [])
 
     def issues(candidate):
         return [f"段落 {i + 1}：{issue}" for i, (original, result) in enumerate(zip(source_pairs, re.findall(pair_pattern, candidate)))
@@ -936,8 +949,11 @@ def translate_segment(
     for attempt in range(3):
         check_cancel(config.cancel_event)
         try:
-            candidate = clean_translation_text(call_chat_completion(replace(config, is_retry=attempt > 0), [
-                {"role": "system", "content": system_prompt},
+            selected_source = "\n\n".join(source_pairs[i] for i in retry_indexes) if retry_indexes is not None else protected
+            request_terms = config.glossary.prompt(selected_source) if config.glossary else ""
+            request_system = SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "") + request_terms
+            candidate = clean_translation_text(call_chat_completion(replace(config, is_retry=attempt > 0, glossary_prompt=request_terms), [
+                {"role": "system", "content": request_system},
                 {"role": "user", "content": active_prompt + feedback},
             ]))
             if retry_indexes is not None:
@@ -989,13 +1005,15 @@ def run(
     max_workers=None,
     cancel_event=None,
     parse_seconds=0,
+    glossary=None,
+    source_info=None,
 ):
     check_cancel(cancel_event)
     from translation_job import run_job
     config = resolve_provider_config(provider=provider, base_url=base_url, api_key=api_key,
                                      api_key_env=api_key_env, model=model, temperature=temperature, timeout=timeout)
     return run_job(sys.modules[__name__], config, input_folder, output_dir, progress_callback=progress_callback,
-                   speed_mode=speed_mode, max_workers=max_workers, cancel_event=cancel_event, parse_seconds=parse_seconds)
+                   speed_mode=speed_mode, max_workers=max_workers, cancel_event=cancel_event, parse_seconds=parse_seconds, glossary=glossary, source_info=source_info)
 
 
 def build_arg_parser():
@@ -1012,6 +1030,8 @@ def build_arg_parser():
     parser.add_argument("--timeout", type=int, help="Request timeout in seconds")
     parser.add_argument("--speed-mode", choices=["safe", "balanced", "fast"])
     parser.add_argument("--max-workers", type=int, help="Override translation worker count (1-4)")
+    parser.add_argument("--global-glossary", help="Explicitly enable a global glossary CSV")
+    parser.add_argument("--book-glossary", help="Explicitly enable a book glossary CSV")
     return parser
 
 
@@ -1021,6 +1041,10 @@ def main(argv=None):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     args = build_arg_parser().parse_args(argv)
+    from glossary import GlossarySnapshot, read_csv
+    glossary = GlossarySnapshot(bool(args.global_glossary), bool(args.book_glossary),
+                                tuple(read_csv(args.global_glossary)) if args.global_glossary else (),
+                                tuple(read_csv(args.book_glossary)) if args.book_glossary else ())
     md, _ = run(
         args.input_folder,
         args.output_dir_opt or args.output_dir_pos,
@@ -1034,6 +1058,7 @@ def main(argv=None):
         speed_mode=args.speed_mode,
         max_workers=args.max_workers,
         progress_callback=lambda info: print(info.get("msg", ""), flush=True),
+        glossary=glossary,
     )
     report = read_json(md.parent / "quality_report.json", {})
     print(f"质量报告：{md.parent / 'quality_report.md'}")

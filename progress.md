@@ -49,3 +49,5 @@
 - Project recommendations remain unimplemented; code changes only address CLI discovery, selected environment propagation, text encoding and detection diagnostics.
 - Stage 1: implemented live UTF-8 log observation, page progress, task-owned process-tree shutdown, metadata/model-aware cache checks, parser lock, fresh attempt directories and original-source records.
 - Focused regression found a test locking the output parent instead of the actual job directory; corrected test path (implementation lock behavior passes).
+- Stage 2: opt-in global/book glossaries, local indexed longest-phrase matching, CSV conflict resolution, bounded explicit extraction, management window, CLI options and per-segment/per-cell effective-term cache keys implemented.
+- Seven focused glossary tests pass, including 10,000 unrelated terms producing identical prompts and only affected segments re-requested. Existing 95 regression tests passed before the new glossary cases.
