@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+import html
 
 
 HEADER_FOOTER_TYPES = {
@@ -28,6 +29,7 @@ class MinerUSidecar:
     block_counts: Counter = field(default_factory=Counter)
     excluded_texts: set[str] = field(default_factory=set)
     formula_texts: list[str] = field(default_factory=list)
+    provenance: list[dict] = field(default_factory=list)
 
     @property
     def has_data(self) -> bool:
@@ -99,7 +101,66 @@ def load_mineru_sidecar(folder: Path) -> MinerUSidecar:
             continue
         sidecar.source_files.append(path.name)
         _walk(data, sidecar)
+    sidecar.provenance = load_provenance(folder)
     return sidecar
+
+
+def location_key(text):
+    text = html.unescape(re.sub(r'<[^>]+>', ' ', text))
+    text = re.sub(r'(?m)^#{1,6}\s+', '', text)
+    return re.sub(r'\s+', '', text).strip()
+
+
+def load_provenance(folder):
+    """Use a single ordered sidecar; never combine duplicate schemas."""
+    candidates = []
+    for pattern in ('*_content_list.json', 'content_list.json', '*_content_list_v2.json', 'content_list_v2.json'):
+        candidates.extend(sorted(Path(folder).glob(pattern)))
+    records = []
+    def walk(node, page=None):
+        if isinstance(node, list):
+            for child in node:
+                walk(child, page)
+        elif isinstance(node, dict):
+            page = node.get('page_idx', page)
+            if isinstance(page, int) and node.get('type') in {'text', 'title', 'paragraph', 'table', 'image', 'equation'}:
+                content = node.get('content', {})
+                if not isinstance(content, dict):
+                    content = {}
+                texts = []
+                for key in ('text', 'table_body', 'table_caption', 'img_caption'):
+                    value = node.get(key)
+                    if isinstance(value, str):
+                        texts.append(value)
+                    elif isinstance(value, list):
+                        texts.extend(v for v in value if isinstance(v, str))
+                for key in ('title_content', 'paragraph_content', 'table_caption', 'image_caption'):
+                    value = content.get(key)
+                    if isinstance(value, list):
+                        texts.append(''.join(str(v.get('content', '')) for v in value if isinstance(v, dict)))
+                if isinstance(content.get('html'), str):
+                    texts.append(content['html'])
+                for text in texts:
+                    if location_key(text):
+                        records.append({'text': text, 'page': page + 1, 'bbox': node.get('bbox'), 'block_id': len(records)})
+                return
+            for child in node.values():
+                if isinstance(child, (list, dict)):
+                    walk(child, page)
+    for path in candidates:
+        data = None
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, list) and data and all(isinstance(page, list) for page in data):
+            for i, page in enumerate(data):
+                walk(page, i)
+        else:
+            walk(data)
+        if records:
+            break
+    return records
 
 
 def strip_excluded_lines(md_text: str, sidecar: MinerUSidecar) -> tuple[str, int]:

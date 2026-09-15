@@ -13,6 +13,36 @@ from task_state import TaskCancelled, task_lock, write_json
 
 
 class LocalParseTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows process-tree ownership')
+    def test_cancellation_stops_spawned_api_child(self):
+        import ctypes
+        from ctypes import wintypes
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / 'api.pid'
+            code = ("import os,time; from pathlib import Path; "
+                    f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)")
+            parent = f"import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', {code!r}]); time.sleep(60)"
+            cancel = threading.Event()
+            timer = threading.Timer(1.5, cancel.set)
+            timer.start()
+            try:
+                with self.assertRaises(TaskCancelled):
+                    run_observed([sys.executable, '-c', parent], td, os.environ.copy(), cancel_event=cancel)
+            finally:
+                timer.join()
+            self.assertTrue(marker.exists())
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x00100000, False, int(marker.read_text()))
+            if handle:
+                try:
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 1000), 0)
+                finally:
+                    kernel.CloseHandle(handle)
+
     def test_unknown_logs_do_not_invent_percent(self):
         events = []
         status = ParseProgress(events.append)

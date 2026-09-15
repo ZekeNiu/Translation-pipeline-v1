@@ -51,3 +51,6 @@
 - Focused regression found a test locking the output parent instead of the actual job directory; corrected test path (implementation lock behavior passes).
 - Stage 2: opt-in global/book glossaries, local indexed longest-phrase matching, CSV conflict resolution, bounded explicit extraction, management window, CLI options and per-segment/per-cell effective-term cache keys implemented.
 - Seven focused glossary tests pass, including 10,000 unrelated terms producing identical prompts and only affected segments re-requested. Existing 95 regression tests passed before the new glossary cases.
+- Stage 3: durable block/cell alignment, conservative source-page matching, reversible manual edits, targeted candidate translation, offline recovery, export retry and bilingual desktop review implemented; 11 focused review tests pass.
+- CI exposed Windows short-path versus resolved long-path differences in local parser returns and a test assertion. Normalized parser output roots and made the PATH test compare resolved paths. No parser cache corruption or environment configuration failure was involved.
+- Local Python 3.11 lacked dependencies; created a separate ignored validation environment under tests/.artifacts and installed only project requirements.

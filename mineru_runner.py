@@ -150,7 +150,7 @@ def parse_with_local_cli(
     if not exe_path:
         raise MinerURunnerError("MinerU CLI was not found. Install MinerU or set the executable path.")
 
-    root = Path(output_root) if output_root else DEFAULT_MINERU_OUTPUT_ROOT
+    root = (Path(output_root) if output_root else DEFAULT_MINERU_OUTPUT_ROOT).resolve()
     source_hash = file_hash(source) if source.is_file() else fingerprint([
         (p.relative_to(source).as_posix(), file_hash(p)) for p in sorted(source.rglob("*")) if p.is_file()])
     identity = fingerprint(source_hash, str(Path(exe_path).resolve()), backend or "auto")

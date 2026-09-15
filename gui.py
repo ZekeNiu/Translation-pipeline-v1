@@ -34,7 +34,7 @@ class App:
         self.current_provider = ""
         self.events, self.cancel_event = queue.Queue(), threading.Event()
         self.running = self.closing = self.auxiliary_busy = False
-        self.glossary_window = None
+        self.glossary_window = self.review_window = None
         self.save_timer = None
         self.active_secrets, self.stage = [], ""
         self.result_dir = self.settings.get("result_dir", "")
@@ -86,6 +86,7 @@ class App:
         self.stop_btn.pack(side="left", padx=10)
         self.open_btn = ttk.Button(actions, text="打开结果", command=self._open_result, state="normal" if self.result_dir else "disabled")
         self.open_btn.pack(side="right")
+        ttk.Button(actions, text="复核译文", command=self._open_review).pack(side="right", padx=8)
         self.progress_label = ttk.Label(page, text=load_error or "就绪", wraplength=750)
         self.progress_label.grid(row=7, sticky="w")
         self.progress = ttk.Progressbar(page)
@@ -369,6 +370,42 @@ class App:
             from dataclasses import replace
             config = replace(config, cancel_event=self.cancel_event)
             self.glossary_window = GlossaryWindow(self.root, GlossaryStore(), book_id, prepare, config, busy)
+        except Exception as exc:
+            self.progress_label.configure(text=str(exc))
+
+    def _open_review(self):
+        from review_gui import ReviewWindow
+        if not self.result_dir or not (Path(self.result_dir) / "task_state.json").is_file():
+            self.progress_label.configure(text="请先完成或继续一个翻译任务，再打开复核。")
+            return
+        if self.review_window and self.review_window.window.winfo_exists():
+            self.review_window.window.lift()
+            return
+        def config_for(document):
+            opts = self._snapshot()
+            original = document.get("config", {})
+            if not original:
+                return resolve_provider_config(**{k: opts[k] for k in ("provider", "base_url", "api_key", "model")})
+            provider = original['provider']
+            if opts['provider'] == provider and opts['base_url'].rstrip('/') == original['base_url'].rstrip('/'):
+                key = opts['api_key']
+            else:
+                saved = self.providers.get(provider, {})
+                if saved.get('base_url', '').rstrip('/') != original['base_url'].rstrip('/'):
+                    raise ValueError("请先在主窗口选择原任务的翻译服务并填写 Key，再重译选中项。")
+                key = saved.get('api_key', '')
+            if not key:
+                raise ValueError("原任务翻译服务缺少 Key；手动编辑与重新导出不需要 Key。")
+            from dataclasses import replace
+            return replace(resolve_provider_config(**original, api_key=key), cancel_event=self.cancel_event)
+        def busy(value):
+            self.auxiliary_busy = value
+            self.run_btn.configure(state='disabled' if value else 'normal')
+            if value:
+                self.cancel_event.clear()
+        try:
+            self.review_window = ReviewWindow(self.root, self.result_dir, config_for,
+                                             lambda: self.running or self.auxiliary_busy, busy)
         except Exception as exc:
             self.progress_label.configure(text=str(exc))
 

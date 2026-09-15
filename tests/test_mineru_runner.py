@@ -38,7 +38,7 @@ class MinerURunnerTests(unittest.TestCase):
                 for key, value in variables.items():
                     self.assertEqual(kwargs["env"][key], value)
                 self.assertEqual(kwargs["env"]["PYTHONIOENCODING"], "utf-8")
-                self.assertIn(str(exe.parent), kwargs["env"]["PATH"].split(os.pathsep))
+                self.assertIn(exe.parent.resolve(), [Path(p).resolve() for p in kwargs["env"]["PATH"].split(os.pathsep) if p])
                 if "-o" in cmd:
                     (Path(cmd[cmd.index("-o") + 1]) / "full.md").write_text("# Parsed", encoding="utf-8")
                 return mineru_runner.subprocess.CompletedProcess(cmd, 0, "mineru 3.4.5", "")

@@ -107,7 +107,7 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
             if state.get("identity"):
                 previous = out / "_previous" / state["identity"][:20]
                 previous.mkdir(parents=True, exist_ok=True)
-                for name in ("translated.md", "translated.docx", "quality_report.json", "quality_report.md", "task_state.json"):
+                for name in ("translated.md", "translated.docx", "quality_report.json", "quality_report.md", "task_state.json", "review_document.json", "review_edits.json", "glossary_snapshot.json", "source_document.json"):
                     if (out / name).is_file():
                         shutil.copy2(out / name, previous / name)
             state = {"version": 3, "identity": identity, "source_hash": document_hash, "config_hash": config_hash, "segments": {}}
@@ -119,6 +119,8 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
         write_json(out / "glossary_snapshot.json", snapshot.to_dict())
         if source_info:
             write_json(out / "source_document.json", source_info)
+        elif (root / 'source_document.json').is_file():
+            write_json(out / 'source_document.json', read_json(root / 'source_document.json', {}))
         write_json(state_path, state)
         progress(f"译文完成后保存到：{out}", stage="prepare", output_dir=str(out), artifact_ready=False)
         try:
@@ -212,7 +214,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     # Each worker has its own memory; persisted request caches handle the next run.
     def worker(index):
         check_cancel(cancel_event)
-        local_tables, local_warnings, memory = [], [], {}
+        local_tables, local_warnings, memory, alignments = [], [], {}, []
         started = time.monotonic()
         pieces = []
         table_index, table_total = 0, sum(b.kind == "table" for b in blocks(segments[index]))
@@ -230,14 +232,18 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         table_seconds = time.monotonic() - started
         started = time.monotonic()
         activity(index, "正文")
-        body_config = replace(config, request_progress=lambda retry: activity(index, "正文", retry))
+        body_config = replace(config, alignments=alignments, request_progress=lambda retry: activity(index, "正文", retry))
         translated = engine.translate_segment("\n\n".join(pieces), excerpts[index - 1][-300:] if index else "", index + 1, len(ids),
                                                config=body_config, cache_dir=cache_dir, consistency_guide=guide, translation_memory=memory,
                                                quality_warnings=local_warnings, next_context=excerpts[index + 1][:300] if index + 1 < len(ids) else "",
                                                chapter_context=chapters[index])
         for report in local_tables:
             report["segment"] = index + 1
-        return translated, local_tables, local_warnings, table_seconds, time.monotonic() - started
+        source_tables = iter(b.text for b in blocks(segments[index]) if b.kind == "table")
+        for unit in alignments:
+            if unit['kind'] == 'table':
+                unit['source'] = next(source_tables)
+        return translated, local_tables, local_warnings, table_seconds, time.monotonic() - started, alignments
 
     started, table_seconds, body_seconds = time.monotonic(), 0, 0
     last_heartbeat = started
@@ -263,7 +269,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                     active.pop(index, None)
                 record = state["segments"][ids[index]]
                 try:
-                    translated, tables, issues, ts, bs = future.result()
+                    translated, tables, issues, ts, bs, alignments = future.result()
                     translations[index] = translated
                     table_seconds += ts
                     body_seconds += bs
@@ -274,7 +280,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                     status = "failed" if failures else "needs_review" if review else "completed"
                     path = out / "_chunks" / f"{ids[index]}.md"
                     atomic_write(path, translated)
-                    record.update(status=status, output_hash=file_hash(path), warnings=issues, tables=tables, seconds=ts + bs)
+                    record.update(status=status, output_hash=file_hash(path), warnings=issues, tables=tables, seconds=ts + bs, alignment=alignments)
                     if not failures:
                         completed += 1
                 except TaskCancelled:
@@ -291,7 +297,20 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                     submit_next()
     check_cancel(cancel_event)
     elapsed = time.monotonic() - started
-    result = "\n\n".join(translations).strip() + "\n"
+    from review import make_document, render_document, load_edits, edit_issues, recover_alignment
+    for i, key in enumerate(ids):
+        record = state['segments'][key]
+        if not record.get('alignment') and record.get('status') in {'completed', 'needs_review'}:
+            try:
+                record['alignment'] = recover_alignment(engine, config, segments[i], translations[i], cache_dir, guide,
+                    excerpts[i - 1][-300:] if i else '', excerpts[i + 1][:300] if i + 1 < len(ids) else '', chapters[i], i + 1, len(ids))
+            except (engine.OfflineCacheMiss, ValueError, TypeError):
+                pass  # Older tasks remain readable even when exact alignment cannot be recovered offline.
+    document = make_document(state, segments, translations, chapters, sidecar, read_json(out / 'source_document.json', {}), config)
+    write_json(out / 'review_document.json', document)
+    edits = load_edits(out, state['identity'])
+    manual_issues = edit_issues(document, edits)
+    result = render_document(document, edits)
     missing_images = _copy_images(result, root, out)
     parse_report = read_json(root / "parse_report.json", {})
     parse_warnings = parse_report.get("warnings", [])
@@ -299,6 +318,8 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     # Valid LaTeX in Markdown is expected. Report commands that remain after Word conversion.
     artifacts = engine.find_latex_artifacts(engine.normalize_inline_output(result))
     status = "partial_failed" if failed else "needs_review" if warnings or parse_warnings or missing_images or artifacts or any(r["residual_english"] or r["inline_artifacts"] or r.get("glossary_warnings") for r in table_reports) else "completed"
+    if manual_issues and status == 'completed':
+        status = 'needs_review'
     progress("正在保存译文与质量报告…", stage="export")
     atomic_write(out / "translated.md", result)
     export_started = time.monotonic()
@@ -317,6 +338,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         docx = None
         status = "partial_failed"
     report = {"status": status, "failed_segments": failed, "warnings": warnings, "tables": table_reports,
+              "manual_review": manual_issues, "manual_edit_count": len(edits['edits']),
               "parse_warnings": parse_warnings, "missing_images": missing_images, "formula_artifacts": artifacts,
               "references": reference_reports, "export_error": export_error, "export_warnings": export_warnings, "error": str(fatal) if fatal else None,
               "timings": {"parse": parse_seconds, "translation_wall": elapsed, "table_workers": table_seconds,
@@ -332,6 +354,8 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
              "", f"共 {len(ids)} 段；本次模型请求 {len(metrics)} 次。", "", "自动检查用于发现结构问题与疑点，不等同于人工语义审校。"]
     lines.extend(["", f"术语命中（按分段累计）：{report['glossary']['matched_terms']}；本次请求附加术语字符：{report['glossary']['prompt_chars']}；本次修订请求：{report['glossary']['retry_requests']}。"] )
     lines.append(f"本书累计术语提取请求：{len(config.glossary.snapshot.extraction_requests)}。服务返回的逐次用量见 JSON 报告。")
+    for item in manual_issues:
+        lines.append(f"- 人工修订 {item['unit']}：" + '；'.join(item['issues']))
     if failed:
         lines.extend(["", "未完成段落：" + ", ".join(map(str, failed))])
         for i in failed:

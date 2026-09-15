@@ -59,6 +59,8 @@ class ProviderConfig:
     request_progress: object = field(default=None, repr=False, compare=False)
     glossary: object = field(default=None, repr=False, compare=False)
     glossary_prompt: str = ""
+    alignments: object = field(default=None, repr=False, compare=False)
+    cache_only: bool = False
 
     def endpoint(self) -> str:
         base = self.base_url.strip().rstrip("/")
@@ -289,6 +291,8 @@ def clean_latex(text: str) -> str:
 # -- OpenAI-compatible chat API --------------------------------------
 def call_chat_completion(config: ProviderConfig, messages, timeout: int | None = None) -> str:
     check_cancel(config.cancel_event)
+    if config.cache_only:
+        raise OfflineCacheMiss('缺少可恢复的请求缓存；未调用翻译服务。')
     if not config.api_key:
         raise ValueError(
             f"Missing API key for {config.provider_name}. "
@@ -629,6 +633,10 @@ def _extract_json_array(text: str):
         raise
 
 
+class OfflineCacheMiss(RuntimeError):
+    pass
+
+
 class _CellValidationError(ValueError):
     def __init__(self, accepted, invalid):
         super().__init__("表格部分单元格未通过数字或结构检查。")
@@ -732,7 +740,7 @@ def _translate_text_batch_resilient(
         return []
     try:
         return _translate_text_batch(items, config, cache_dir, prefix, consistency_guide)
-    except (TaskCancelled, RemoteError):
+    except (TaskCancelled, RemoteError, OfflineCacheMiss):
         raise
     except Exception as exc:
         if len(items) == 1:
@@ -932,7 +940,14 @@ def translate_segment(
             quality_warnings.append({"segment": idx, "phrases": warnings})
         translation_memory[key] = candidate
         payloads = re.findall(r"\[\[\[TP_BEGIN_\d+\]\]\]([\s\S]*?)\[\[\[TP_END_\d+\]\]\]", candidate)
-        return "\n\n".join(restore_placeholders(payload.strip(), placeholders).strip() for payload in payloads)
+        restored = [restore_placeholders(payload.strip(), placeholders).strip() for payload in payloads]
+        if config.alignments is not None:
+            original = document_blocks(segment)
+            if len(original) != len(restored):
+                raise ValueError("原译文结构对应数量不一致。")
+            config.alignments.extend({'kind': block.kind, 'source': block.text, 'translated': text}
+                                     for block, text in zip(original, restored))
+        return "\n\n".join(restored)
 
     cached = translation_memory.get(key) or _read_cache(cache_path)
     if cached is not None:
