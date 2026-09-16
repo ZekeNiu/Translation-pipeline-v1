@@ -71,3 +71,6 @@
 - Final local regression: 131 tests pass on Windows Python 3.11 (25.839s) and 3.14 (21.742s). User task migrated with a complete legacy snapshot; reexport guarded against all model calls.
 - Visual QA: native Word PDF export, all-page contact sheets, bilingual review window. Corrected chained figure captions, width handling for 13-column table, redundant nested formula font groups and source chapter attribution. Result 28 pages; 27 review issues include 5 unadopted omission candidates.
 - Staged pushes: 86dbff2 storage/report foundation; 70a7d04 conservative parser metadata; f60b651 integrated export/review workflow. Final acceptance commit pending.
+
+- Final concurrency audit: settings change and reexport now share one lock; prior layout settings enter history first. Added GUI source/translation/ID search. Preparation upgrades reuse only exact hash-validated original segment snapshots; real task copy resumed all 8 segments with zero model calls.
+- Updated complete suite: 133 tests pass locally on Windows Python 3.11 (27.119s) and 3.14 (23.215s). GitHub passed f25d9dc on both versions before the final preparation regression addition.

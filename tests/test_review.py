@@ -51,6 +51,16 @@ class ReviewTests(unittest.TestCase):
         self.assertIn(unit['translated'], (self.out / 'translated.md').read_text(encoding='utf-8'))
         self.assertTrue(list((artifact(self.out, '_review_history')).glob('*/translated.docx')))
 
+    def test_cleanup_upgrade_keeps_validated_segments_and_manual_edits(self):
+        self.md.write_text('Force 3.\n\nOther 4.', encoding='utf-8')
+        self.run_job()
+        unit = self.units()[0]
+        save_edit(self.out, unit['id'], '人工核定力为 3。')
+        with patch('translation_job.strip_excluded_lines', side_effect=lambda text, _: (text + '\n\nNew retained header.', 0)), patch(
+                'translate.call_chat_completion', side_effect=AssertionError('No model call after cleanup upgrade')):
+            translate.run(self.source, self.out, **self.kwargs)
+        self.assertIn('人工核定力为 3', (self.out / 'translated.md').read_text(encoding='utf-8'))
+
     def test_formula_structure_cannot_be_overwritten(self):
         self.md.write_text('Force $x^2$ is 3.', encoding='utf-8')
         self.run_job()

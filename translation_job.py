@@ -168,6 +168,17 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     if sidecar.has_data:
         write_sidecar_summary(sidecar, artifact(out, 'mineru_structure_summary.json'))
     segments = engine.split_body_into_segments("\n\n".join(prepared))
+    # A cleanup-rule upgrade must not repartition an existing book, discard edits,
+    # or silently request the whole translation again. Reuse only exact, hashed
+    # original segment snapshots belonging to this unchanged source/config.
+    previous_document = read_json(artifact(out, 'review_document.json'), {})
+    if previous_document.get('identity') == state['identity']:
+        previous_segments = previous_document.get('segments', [])
+        restored = ['\n\n'.join(u['source'] for u in segment['units'] if not u.get('omission_id')) for segment in previous_segments]
+        if restored and all(fingerprint(text) == state['segments'].get(segment['id'], {}).get('source_hash')
+                            for text, segment in zip(restored, previous_segments)):
+            segments = restored
+            raw = '\n\n'.join(restored)
     excerpts = [_excerpt(s) for s in segments]
     chapters, chapter = [], ""
     for text in segments:

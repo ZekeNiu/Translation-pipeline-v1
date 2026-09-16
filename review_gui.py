@@ -46,6 +46,11 @@ class ReviewWindow:
             button.pack(side='left', padx=5)
             if text != '打开质量报告':
                 self.controls.append(button)
+        self.query = tk.StringVar()
+        search = ttk.Entry(settings, textvariable=self.query, width=24)
+        search.pack(side='right')
+        ttk.Label(settings, text='搜索编号 / 原译文 ').pack(side='right')
+        self.query.trace_add('write', lambda *_: self.refresh_list())
         listing = ttk.Frame(self.window)
         listing.pack(fill='x', padx=10)
         self.tree = ttk.Treeview(listing, columns=('section', 'page', 'kind', 'issue'), show='headings', height=8, selectmode='browse')
@@ -110,6 +115,9 @@ class ReviewWindow:
         labels = {'text': '正文', 'heading': '标题', 'caption': '图表标题', 'cell': '表格单元格',
                   'reference': '参考文献', 'formula': '公式', 'image': '图片', 'code': '代码', 'unmapped': '未对应', 'table': '表格'}
         for unit in self.units:
+            query = self.query.get().strip().casefold()
+            if query and query not in (' '.join((unit['id'], unit['source'], effective_text(unit, self.edits)))).casefold():
+                continue
             issues = self.issues(unit)
             if self.filter.get() and not issues:
                 continue
