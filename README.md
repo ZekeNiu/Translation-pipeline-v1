@@ -4,6 +4,8 @@
 
 ## 开始使用
 
+新版结果目录只展示 Markdown、Word 和 HTML/Markdown 质量报告，其余放入 `_internal`。质量报告可定位原页并显示原译对照；复核窗口支持确认保留、按需改译和漏段恢复。导出默认 A4，可预览原书页眉页脚样式并重新生成译文页码。详见[使用、验证及回退说明](docs/output-review-layout-20260916.md)。
+
 Windows，Python 3.11 或更高版本：
 
 ```powershell

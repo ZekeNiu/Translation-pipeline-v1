@@ -135,13 +135,13 @@ def make_document(state, segments, translations, chapters, sidecar, source_info,
                 'config': {'provider': config.provider_name, 'base_url': config.base_url,
                            'model': config.model, 'temperature': config.temperature}, 'segments': []}
     matcher = config.glossary or GlossaryMatcher()
+    current_chapter = ''
     for index, (source, translated) in enumerate(zip(segments, translations)):
         seg_id = f's{index:05d}_{fingerprint(source)[:12]}'
         record = state['segments'].get(seg_id, {})
         alignment = deepcopy(record.get('alignment', []))
         if not alignment:
             alignment = [{'source': source, 'translated': translated, 'kind': 'unmapped'}]
-        current_chapter = chapters[index]
         for i, unit in enumerate(alignment):
             if unit['kind'] == 'heading' and re.match(r'^#{1,3}\s', unit['source']):
                 current_chapter = unit['source']
@@ -270,16 +270,19 @@ def enrich_document(out, document):
         document['omissions'] = find_omissions(load_mineru_sidecar(source.parent), source.read_text(encoding='utf-8'), top_units)
     recoveries = read_json(artifact(out, 'recovered_units.json'), {})
     if recoveries.get('identity') == document['identity']:
-        existing = {u['id'] for u in top_units}
-        for saved in recoveries.get('units', []):
-            if saved['id'] in existing:
-                continue
+        for segment in document['segments']:
+            segment['units'] = [u for u in segment['units'] if not u.get('omission_id')]
+        for saved in sorted(recoveries.get('units', []), key=lambda u: (u.get('page', 0), (u.get('bbox') or [0,0])[1])):
             for segment in document['segments']:
                 index = next((i for i, u in enumerate(segment['units']) if u['id'] == saved['insert_before']), None)
                 if index is not None:
                     segment['units'].insert(index, deepcopy(saved))
-                    existing.add(saved['id'])
                     break
+    chapter = '封面 / 前置内容'
+    for unit in all_units(document):
+        if unit['kind'] == 'heading':
+            chapter = re.sub(r'^#{1,6}\s+', '', unit['source'])
+        unit['chapter'] = chapter
     return document
 
 
@@ -416,7 +419,7 @@ def omission_unit(document, omission_id):
     if not item.get('insert_before'):
         raise ValueError('不能可靠确定插入位置，请先对照原页核查。')
     anchor = unit_by_id(document, item['insert_before'])
-    return {**item, 'kind': 'text', 'translated': '', 'omission_id': omission_id,
+    return {**item, 'kind': item.get('kind', 'text'), 'translated': '', 'omission_id': omission_id,
             'source_hash': fingerprint(item['source']), 'chapter': anchor['chapter'],
             'segment': anchor['segment'], 'issues': [], 'glossary_terms': []}
 

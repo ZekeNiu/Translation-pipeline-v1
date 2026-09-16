@@ -161,7 +161,8 @@ def find_omissions(sidecar, markdown, units):
                      and u['bbox'][1] >= record['bbox'][3] and u.get('kind') != 'cell']
         following.sort(key=lambda u: (u['bbox'][1], u['bbox'][0]))
         result.append({'id': 'omission_' + fingerprint(record['page'], record['bbox'], text)[:16],
-                       'source': text, 'page': record['page'], 'bbox': record['bbox'],
+                       'source': '## ' + text if is_heading else text, 'kind': 'heading' if is_heading else 'text',
+                       'page': record['page'], 'bbox': record['bbox'],
                        'insert_before': following[0]['id'] if following else None,
                        'reason': '解析疑似遗漏：正文区域内容被标为页眉页脚，未进入解析正文。'})
     return result

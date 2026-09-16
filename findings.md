@@ -37,3 +37,8 @@
 - Smoke harness initially used the shell's GBK stdout and failed while printing an existing emoji progress message before MinerU launched. Reran the diagnostic with Python UTF-8 enabled; product GUI uses its queue and is unaffected.
 - Review evidence: consistency guide currently supplies generic rules/acronyms, sidecar stores summaries rather than block page/bbox provenance, local CLI captures logs without live progress, and local parse cache identity omits engine/model version. These remain recommendations only.
 - Reference projects checked: BabelDOC glossary and bilingual outputs; Docling unified document representation; PDFMathTranslate-next Windows distribution.
+
+## Output/layout follow-up findings
+- Existing parser classified introduction and front-matter contributor records as headers and omitted them from Markdown. Recovery must be explicit and source-grounded. Footer logos are present in the original PDF and can be reproduced locally without OCR/model calls.
+- Formula formatting normalization must precede local numeric comparison. Nested plain font groups are safe to collapse, while actual changed values remain warnings.
+- Caption keep-next must not transitively bind the next image after a caption that already follows an image. Wide-table section breaks and portrait image sizing were verified in native Word.

@@ -53,3 +53,12 @@ Defaults: global/book independently off, book overrides global, manual/imported 
 - [done] Two-level opt-in glossary, bounded explicit extraction, selective cache behavior and management UI.
 - [done] Persisted source/translation alignment, reversible edits, targeted retry, offline recovery and review UI.
 - [done] Final functional code passed both Windows CI versions (117 tests); release 8c88eff merged to main, tagged release/high-priority-20260915 and verified remotely. Rollback tag points to 517df3e. Subsequent commits only record this publication audit.
+# Output/review/layout follow-up (2026-09-16)
+
+- [done] Back up baseline and user's task; migrate auxiliary outputs into `_internal` with recoverable path handling.
+- [done] Unified located HTML/Markdown quality issues and confirmed-retention review workflow.
+- [done] Conservative page furniture filtering, omission detection and explicit selected recovery.
+- [done] A4 semantic pagination, wide tables, original furniture with new page fields, preview/settings.
+- [ ] Windows 3.11/3.14 regression, actual-document no-model reexport and Word/PDF visual inspection; staged GitHub release.
+
+Defaults: preserve original furniture style where safe; comfortable Chinese reflow; AI suggestions/recovery only on explicit selection. Do not retranslate existing task automatically.
