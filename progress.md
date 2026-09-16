@@ -76,3 +76,7 @@
 - Updated complete suite: 133 tests pass locally on Windows Python 3.11 (27.119s) and 3.14 (23.215s). GitHub passed f25d9dc on both versions before the final preparation regression addition.
 
 - Final feature ddfffd5 passed GitHub Windows 3.11/3.14 (133 tests each), run 35050203134. All implementation and local/remote acceptance complete. Publishing documentation-only audit with release/output-review-layout-20260916; baseline rollback remains d4a5801.
+# Long-book usability implementation — 2026-09-16
+- Authorized implementation started at clean 6f32e3a. Read planning/debugging skills; confirmed baseline and interfaces.
+- All real document data and credentials remain local. No automatic retranslations or omission adoption.
+- First export regression found Windows fsync rejects a read-only file descriptor; changed the copied staging file handle to read/write before flushing. A mistaken read command used a word instead of numeric Select-Object offset; reran with numeric offset.

@@ -42,3 +42,9 @@
 - Existing parser classified introduction and front-matter contributor records as headers and omitted them from Markdown. Recovery must be explicit and source-grounded. Footer logos are present in the original PDF and can be reproduced locally without OCR/model calls.
 - Formula formatting normalization must precede local numeric comparison. Nested plain font groups are safe to collapse, while actual changed values remain warnings.
 - Caption keep-next must not transitively bind the next image after a caption that already follows an image. Wide-table section breaks and portrait image sizing were verified in native Word.
+# Long-book usability inspection (2026-09-16)
+- Actual report: 140 top-level units, 696 table cells, 5 omissions, 27 issue entries; UI flat list 831 items.
+- Save and confirmation currently back up whole artifacts and rebuild DOCX; search recomputes every issue on every key.
+- Cloud has durable partitions; local/custom API lack equivalent resume. Installed MinerU 3.4.5 uses a default 64-page processing window.
+- Table requests omit row/column context and share text-only cell translations. Body neighbor excerpts are fixed at 300 characters.
+- Main GUI remembers one result directory; custom API emits strings although GUI expects structured events.

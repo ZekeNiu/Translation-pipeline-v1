@@ -7,6 +7,35 @@ from task_paths import artifact
 from task_state import atomic_write, fingerprint, write_json, file_hash
 
 
+def issue_category(reasons, kind=''):
+    text = '；'.join(reasons)
+    if kind == 'omission' or any(s in text for s in ('遗漏', '结构', '对应', '未完成', '失败')):
+        return '完整性与结构', 0
+    if '数字' in text or '数值' in text:
+        return '数值与单位', 1
+    if '术语' in text:
+        return '术语', 2
+    return ('翻译疑点', 3) if reasons else ('一般信息', 4)
+
+
+def issue_detail(unit, edits, reasons):
+    from review import effective_text
+    from translation_checks import numbers
+    text = effective_text(unit, edits)
+    details = list(reasons)
+    if any('数字' in reason or '数值' in reason for reason in reasons):
+        source, target = numbers(unit['source']), numbers(text)
+        missing, extra = source - target, target - source
+        if missing:
+            details.append('原文有而现译缺少：' + '、'.join(missing.elements()))
+        if extra:
+            details.append('现译新增或不同：' + '、'.join(extra.elements()))
+    for term in unit.get('glossary_terms', []):
+        if term['target'] not in text:
+            details.append(f"指定译法：{term['source']} → {term['target']}")
+    return '；'.join(details)
+
+
 def active_issues(unit, edits):
     from review import effective_text, text_issues
     from glossary import GlossaryMatcher, GlossarySnapshot
@@ -53,15 +82,21 @@ def collect_issues(document, edits, report):
         reasons = active_issues(unit, edits)
         if not reasons:
             continue
+        from review_index import disposition
+        category, rank = issue_category(reasons, unit['kind'])
         rows.append({'id': unit['id'], 'kind': unit['kind'], 'chapter': unit.get('chapter', ''),
                      'page': unit.get('page'), 'pages': unit.get('pages', []),
                      'row': unit.get('row'), 'column': unit.get('column'),
                      'source': unit['source'], 'translated': effective_text(unit, edits),
-                     'reasons': reasons, 'severity': '需核对',
+                     'reasons': reasons, 'severity': category, 'rank': rank, 'status': disposition(unit, edits),
+                     'detail': issue_detail(unit, edits, reasons),
                      'suggestion': '\n'.join(dict.fromkeys(suggestion(r) for r in reasons))})
     recovered = {u.get('omission_id') for u in all_units(document)}
     for item in document.get('omissions', []):
         if item['id'] in recovered:
+            continue
+        from review_index import disposition
+        if disposition({**item, 'translated': '', 'issues': [item['reason']]}, edits) == 'dismissed':
             continue
         rows.append({**item, 'kind': 'omission', 'chapter': '解析遗漏检查', 'translated': '未进入译文',
                      'severity': '解析疑似遗漏', 'reasons': [item['reason']],
@@ -75,7 +110,7 @@ def collect_issues(document, edits, report):
             rows.append({'id': f'{key}:{index}', 'chapter': '导出与解析', 'page': None,
                          'source': '', 'translated': '', 'severity': '信息' if informative else '需核对', 'reasons': [str(value)],
                          'suggestion': '请核对原页与导出结果；导出失败可单独重试。'})
-    return rows
+    return sorted(rows, key=lambda row: row.get('rank', 0 if row.get('kind') == 'omission' else 4))
 
 
 def page_links(out, document, rows):
@@ -130,9 +165,9 @@ def write_reports(out, document, edits, report, assets_out=None):
         location = f"原 PDF 第 {'、'.join(map(str, pages))} 页" if pages else '页码未定位'
         if row.get('row'):
             location += f"；表格第 {row['row']} 行、第 {row['column']} 列"
-        reason = '；'.join(row['reasons'])
+        reason = row.get('detail') or '；'.join(row['reasons'])
         anchors = ' '.join(f'<a href="{quote(links[p], safe="/")}">打开原第 {p} 页</a>' for p in pages if p in links)
-        cards.append(f'<article id="{e(row["id"], quote=True)}"><h2>{e(row["severity"])} · {e(location)}</h2>'
+        cards.append(f'<article data-category="{e(row["severity"], quote=True)}" id="{e(row["id"], quote=True)}"><h2>{e(row["severity"])} · {e(location)}</h2>'
                      f'<p>{e(row.get("chapter", ""))} · 编号 {e(row["id"])}</p><p>{anchors}</p>'
                      f'<div class="pair"><section><h3>原文</h3><pre>{e(row["source"])}</pre></section>'
                      f'<section><h3>当前译文</h3><pre>{e(row["translated"])}</pre></section></div>'
@@ -151,7 +186,15 @@ def write_reports(out, document, edits, report, assets_out=None):
                 '.pair{display:grid;grid-template-columns:1fr 1fr;gap:24px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}a{color:#165db1}'
                 '@media(max-width:750px){.pair{grid-template-columns:1fr}}</style>'
                 f'<h1>{title}</h1><p>{e(summary)}</p><p>{e(intro)}</p><p>在翻译工具的“复核译文”窗口按编号选择项目，可编辑、确认保留或生成改译候选。</p>'
-                + ''.join(cards) + f'<p>{e(footer)}</p></html>')
+                + '<label>搜索原文、译文或位置 <input id="search" type="search"></label> '
+                + '<label>问题类别 <select id="category"><option value="">全部</option>'
+                + ''.join(f'<option>{e(c)}</option>' for c in sorted({r['severity'] for r in rows})) + '</select></label> <span id="count"></span>'
+                + ''.join(cards) + f'<p>{e(footer)}</p>'
+                + '<script>const s=document.getElementById("search"),c=document.getElementById("category");'
+                'function filter(){let n=0;document.querySelectorAll("article").forEach(a=>{'
+                'a.hidden=!(a.textContent.toLowerCase().includes(s.value.toLowerCase())&&(!c.value||a.dataset.category===c.value));'
+                'if(!a.hidden)n++;});document.getElementById("count").textContent="显示 "+n+" 项";}'
+                's.addEventListener("input",filter);c.addEventListener("change",filter);filter();</script></html>')
     atomic_write(out / 'quality_report.html', html_doc)
     atomic_write(out / 'quality_report.md', '\n'.join(markdown))
     write_json(artifact(out, 'quality_report.json'), report)

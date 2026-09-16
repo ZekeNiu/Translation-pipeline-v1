@@ -66,4 +66,7 @@ def translation_lock(out):
             with task_lock(out):
                 migrate(out)
             (out / '.run.lock').unlink(missing_ok=True)
+        from review_state import recover_publication, ensure_schema
+        recover_publication(out)
+        ensure_schema(out)
         yield

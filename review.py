@@ -327,10 +327,11 @@ def backup_artifacts(out):
     return directory
 
 
-def _export_review(out, document, edits):
+def _export_review(out, document, edits, *, revision=None, publish_locked=True):
     from make_docx import make_docx
     enrich_document(out, document)
-    write_json(artifact(out, 'review_document.json'), document)
+    if publish_locked:
+        write_json(artifact(out, 'review_document.json'), document)
     text = public_markdown(render_document(document, edits))
     report = read_json(artifact(out, 'quality_report.json'), {})
     from inline_semantics import normalize_inline_output
@@ -338,8 +339,11 @@ def _export_review(out, document, edits):
     report['formula_artifacts'] = find_latex_artifacts(normalize_inline_output(text))
     report['manual_review'] = edit_issues(document, edits)
     report['manual_edit_count'] = len(edits['edits'])
-    stage = artifact(out, '_review_export')
-    stage.mkdir(exist_ok=True)
+    from review_state import revision_state, publish, export_failed
+    if revision is None:
+        revision = revision_state(out)['revision']
+    stage = artifact(out, '_review_export') / uuid.uuid4().hex
+    stage.mkdir(parents=True)
     try:
         from export_layout import prepare_layout
         warnings = make_docx(text, stage / 'translated.docx', out, layout=prepare_layout(out, document)) or []
@@ -350,20 +354,31 @@ def _export_review(out, document, edits):
         write_json(stage / 'quality_report.json', report)
         from quality_report import write_reports
         write_reports(stage, document, edits, report, assets_out=out)
-        for name in ('translated.md', 'translated.docx', 'quality_report.json', 'quality_report.md', 'quality_report.html'):
-            os.replace(artifact(stage, name), artifact(out, name))
-        state = read_json(artifact(out, 'task_state.json'), {})
-        state.update(status=report['status'])
-        write_json(artifact(out, 'task_state.json'), state)
+        def commit():
+            publish(out, stage, revision)
+            state = read_json(artifact(out, 'task_state.json'), {})
+            state.update(status=report['status'])
+            write_json(artifact(out, 'task_state.json'), state)
+        if publish_locked:
+            commit()
+        else:
+            with translation_lock(out):
+                commit()
     except Exception as exc:
         # The durable edit journal remains ready for an export-only retry.
         report.update(status='partial_failed', export_error=str(exc), review_export_pending=True)
-        from quality_report import write_reports
-        write_reports(out, document, edits, report)
+        def failed():
+            export_failed(out, exc)
+            write_json(artifact(out, 'quality_report.json'), report)
+        if publish_locked:
+            failed()
+        else:
+            with translation_lock(out):
+                failed()
         raise
 
 
-def save_edit(out, unit_id, text, *, allow_warnings=False, restore=False, expected_revision=None):
+def save_edit(out, unit_id, text, *, allow_warnings=False, restore=False, expected_revision=None, export=True):
     out = Path(out)
     with translation_lock(out):
         document = read_json(artifact(out, 'review_document.json'))
@@ -379,31 +394,41 @@ def save_edit(out, unit_id, text, *, allow_warnings=False, restore=False, expect
         issues = validate_edit(unit, text) + matcher.issues(unit['source'], text)
         if issues and not allow_warnings:
             raise ValueError('译文有待核对项：' + '；'.join(issues))
-        backup_artifacts(out)
+        if export:
+            backup_artifacts(out)
         unit['glossary_terms'] = matcher.matches(unit['source'])
         previous['history'].append({'text': text, 'time': datetime.now(timezone.utc).isoformat(),
                                     'issues': issues, 'glossary_terms': unit.get('glossary_terms', [])})
         edits['edits'][unit_id] = previous
         write_json(artifact(out, 'review_edits.json'), edits)
         write_json(artifact(out, 'review_document.json'), document)
-        _export_review(out, document, edits)
+        from review_state import changed
+        changed(out)
+        if export:
+            _export_review(out, document, edits)
         return issues
 
 
 def reexport(out, *, export_options=None):
     out = Path(out)
-    with translation_lock(out):
-        document = read_json(artifact(out, 'review_document.json'))
-        backup_artifacts(out)
-        if export_options is not None:
-            from export_layout import MODES
-            if export_options.get('header_mode') not in MODES:
-                raise ValueError('未知页眉页脚样式。')
-            write_json(artifact(out, 'export_options.json'), {'version': 1, **export_options})
-        _export_review(out, document, load_edits(out, document['identity']))
+    with task_lock(artifact(out, '_export_lock')):
+        with translation_lock(out):
+            document = read_json(artifact(out, 'review_document.json'))
+            enrich_document(out, document)
+            write_json(artifact(out, 'review_document.json'), document)
+            from review_state import revision_state, changed
+            if export_options is not None:
+                from export_layout import MODES
+                if export_options.get('header_mode') not in MODES:
+                    raise ValueError('未知页眉页脚样式。')
+                write_json(artifact(out, 'export_options.json'), {'version': 1, **export_options})
+                changed(out)
+            revision = revision_state(out)['revision']
+            edits = load_edits(out, document['identity'])
+        _export_review(out, document, edits, revision=revision, publish_locked=False)
 
 
-def confirm_unit(out, unit_id, *, expected_revision=None):
+def confirm_unit(out, unit_id, *, expected_revision=None, export=True):
     from quality_report import active_issues
     out = Path(out)
     with translation_lock(out):
@@ -413,10 +438,14 @@ def confirm_unit(out, unit_id, *, expected_revision=None):
             raise ValueError('其他窗口已修改此任务，请刷新后重试。')
         unit = unit_by_id(document, unit_id)
         issues = active_issues(unit, edits)
-        backup_artifacts(out)
+        if export:
+            backup_artifacts(out)
         edits.setdefault('confirmations', {})[unit_id] = fingerprint(unit['source'], effective_text(unit, edits), issues, unit.get('glossary_terms', []))
         write_json(artifact(out, 'review_edits.json'), edits)
-        _export_review(out, document, edits)
+        from review_state import changed
+        changed(out)
+        if export:
+            _export_review(out, document, edits)
 
 
 def omission_unit(document, omission_id):
@@ -427,6 +456,39 @@ def omission_unit(document, omission_id):
     return {**item, 'kind': item.get('kind', 'text'), 'translated': '', 'omission_id': omission_id,
             'source_hash': fingerprint(item['source']), 'chapter': anchor['chapter'],
             'segment': anchor['segment'], 'issues': [], 'glossary_terms': []}
+
+
+def set_disposition(out, unit_ids, status, *, note='', expected_revision=None):
+    """Explicit, reversible decisions, bound to the actual text and constraints."""
+    from review_index import ReviewIndex, decision_key
+    from review_state import changed
+    if status not in {'open', 'deferred', 'confirmed', 'dismissed'}:
+        raise ValueError('未知处理状态。')
+    out = Path(out)
+    with translation_lock(out):
+        document = read_json(artifact(out, 'review_document.json'))
+        edits = load_edits(out, document['identity'])
+        if expected_revision is not None and fingerprint(document, edits) != expected_revision:
+            raise ValueError('任务已被修改，请刷新后重试。')
+        index = ReviewIndex(document, edits)
+        for key in unit_ids:
+            unit = index.units[key]
+            if unit['kind'] == 'omission' and status == 'confirmed':
+                raise ValueError('疑似漏段请恢复，或记录无需恢复的原因。')
+            if status == 'dismissed' and (unit['kind'] != 'omission' or not note.strip()):
+                raise ValueError('请为无需恢复的漏段填写核对依据。')
+        for key in unit_ids:
+            unit = index.units[key]
+            records = edits.setdefault('decision_history', {}).setdefault(key, [])
+            records.append({'status': status, 'note': note, 'time': datetime.now(timezone.utc).isoformat()})
+            edits.setdefault('dispositions', {})[key] = {'status': status, 'key': decision_key(unit, edits), 'note': note}
+            if status == 'confirmed':
+                edits.setdefault('confirmations', {})[key] = fingerprint(unit['source'], effective_text(unit, edits),
+                    index.rows[key]['issues'], unit.get('glossary_terms', []))
+            elif status == 'open':
+                edits.setdefault('confirmations', {}).pop(key, None)
+        write_json(artifact(out, 'review_edits.json'), edits)
+        changed(out)
 
 
 def propose_omission(out, omission_id, config):
@@ -454,7 +516,7 @@ def propose_omission(out, omission_id, config):
             write_json(artifact(out, 'review_requests.json'), read_json(artifact(out, 'review_requests.json'), []) + metrics)
 
 
-def adopt_omission(out, omission_id, text, *, expected_revision=None):
+def adopt_omission(out, omission_id, text, *, expected_revision=None, export=True):
     out = Path(out)
     with translation_lock(out):
         document = read_json(artifact(out, 'review_document.json'))
@@ -470,10 +532,16 @@ def adopt_omission(out, omission_id, text, *, expected_revision=None):
             raise ValueError('补译记录属于另一任务，未覆盖。')
         if any(u['id'] == unit['id'] for u in recovered['units']):
             raise ValueError('该漏段已恢复，请刷新后在正文中编辑。')
-        backup_artifacts(out)
+        if export:
+            backup_artifacts(out)
         recovered['units'].append(unit)
         write_json(artifact(out, 'recovered_units.json'), recovered)
-        _export_review(out, document, edits)
+        from review_state import changed
+        changed(out)
+        enrich_document(out, document)
+        write_json(artifact(out, 'review_document.json'), document)
+        if export:
+            _export_review(out, document, edits)
 
 
 def propose_translation(out, unit_id, config):

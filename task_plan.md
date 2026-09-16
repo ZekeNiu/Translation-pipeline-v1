@@ -62,3 +62,12 @@ Defaults: global/book independently off, book overrides global, manual/imported 
 - [done] Windows 3.11/3.14 regression, actual-document no-model reexport and Word/PDF visual inspection; staged GitHub release.
 
 Defaults: preserve original furniture style where safe; comfortable Chinese reflow; AI suggestions/recovery only on explicit selection. Do not retranslate existing task automatically.
+
+## Long-book usability (approved 2026-09-16)
+Baseline: 6f32e3a. Preserve user data, original interfaces, opt-in model calls and staged GitHub rollback.
+1. [in progress] Baseline tag and branch; revision/export transaction and durable issue state.
+2. [pending] Issue-first review, grouped tables, chapter reading, task library and independent save/export.
+3. [pending] Resumable local/custom API long-PDF parsing, safe boundaries and shared local service.
+4. [pending] Bounded semantic context and context-aware table caches; stable content identities.
+5. [pending] Performance/storage/usage, migration, Windows regression, live and visual acceptance; staged push and main release.
+Acceptance: 10k-unit UI search/switch <=500 ms and single-edit save target <=1s; 1k-page synthetic planning; no model requests for navigation/confirmation/export; retain existing manual revisions and previous valid artifacts.
