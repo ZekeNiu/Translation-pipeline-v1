@@ -20,7 +20,9 @@ def needs_parts(source, strategy=None):
     try:
         with PdfReader(source) as reader:
             count = len(reader.pages)
-        return count > int(strategy.get('threshold_pages', 256)) or (strategy.get('max_bytes') and Path(source).stat().st_size > strategy['max_bytes']) or count > int(strategy.get('max_pages', 10**9))
+        return bool(count > int(strategy.get('threshold_pages', 256)) or
+                    (strategy.get('max_bytes') and Path(source).stat().st_size > strategy['max_bytes']) or
+                    count > int(strategy.get('service_max_pages', 10**9)))
     except Exception:
         # The parser still owns validation for legacy/direct invocations.
         return False
@@ -29,6 +31,11 @@ def needs_parts(source, strategy=None):
 def managed_parse(source, root, signature, run_part, *, strategy=None, progress=None, cancel_event=None, service=None):
     source = Path(source).resolve()
     strategy = strategy or {}
+    maximum = min(int(strategy.get('max_pages', 192)), int(strategy.get('service_max_pages', 10**9)))
+    target = min(int(strategy.get('target_pages', 128)), maximum)
+    minimum = min(int(strategy.get('min_pages', 64)), target)
+    if min(maximum, target, minimum) < 1:
+        raise ValueError('分片页数必须为正整数。')
     identity = fingerprint(file_hash(source), signature, strategy, PDF_PLAN_VERSION)
     directory = Path(root) / ('parts_v2_' + identity[:20])
     with task_lock(directory):
@@ -36,8 +43,8 @@ def managed_parse(source, root, signature, run_part, *, strategy=None, progress=
         state = read_json(manifest, {})
         if not state.get('parts') or any(not Path(p['path']).is_file() or file_hash(p['path']) != p['sha256'] for p in state['parts']):
             parts, warnings, count = prepare_parts(source, directory / 'inputs',
-                max_pages=int(strategy.get('max_pages', 192)), max_bytes=int(strategy.get('max_bytes', 2**63 - 1)),
-                target_pages=int(strategy.get('target_pages', 128)), min_pages=int(strategy.get('min_pages', 64)), cancel_event=cancel_event)
+                max_pages=maximum, max_bytes=int(strategy.get('max_bytes', 2**63 - 1)),
+                target_pages=target, min_pages=minimum, cancel_event=cancel_event)
             state = {'version': 2, 'identity': identity, 'parts': [p.record() for p in parts], 'warnings': warnings, 'page_count': count}
             write_json(manifest, state)
         parts = state['parts']
@@ -92,7 +99,9 @@ def local_service(executable, env, directory, *, progress=None, cancel_event=Non
     with (log_dir / 'service.log').open('wb') as log:
         options = {'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
         child = subprocess.Popen([str(python), '-m', 'mineru.cli.fast_api', '--host', '127.0.0.1', '--port', str(port)],
-            env={**env, 'MINERU_MAX_CONCURRENT_REQUESTS': '1', 'PYTHONUNBUFFERED': '1'}, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **options)
+            env={**{k: v for k, v in env.items() if k != 'MINERU_API_SHUTDOWN_ON_STDIN_EOF'},
+                 'MINERU_API_MAX_CONCURRENT_REQUESTS': '1', 'MINERU_API_OUTPUT_ROOT': str(log_dir / 'output'),
+                 'PYTHONUNBUFFERED': '1'}, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **options)
         try:
             start = time.monotonic()
             with requests.Session() as session:

@@ -245,9 +245,33 @@ def _first_json_value(data: Any, keys: tuple[str, ...]) -> Any:
 
 
 def _write_markdown_from_json(data: Any, out_dir: Path) -> bool:
+    if isinstance(data, dict) and isinstance(data.get('results'), dict):
+        records = [r for r in data['results'].values() if isinstance(r, dict)]
+        if len(records) != 1:
+            raise MinerURunnerError('单文件请求返回多个文档，不能猜测对应结果。')
+        record = records[0]
+        if isinstance(record.get('md_content'), str) and record['md_content'].strip():
+            import base64
+            (out_dir / 'full.md').write_text(record['md_content'], encoding='utf-8')
+            for key, name in [('content_list', 'content_list.json'), ('middle_json', 'result_middle.json')]:
+                value = record.get(key)
+                if isinstance(value, str):
+                    value = json.loads(value)
+                if isinstance(value, (dict, list)):
+                    write_json(out_dir / name, value)
+            for name, value in (record.get('images') or {}).items():
+                if Path(name).name != name or '/' in name or '\\' in name or ':' in name:
+                    raise MinerURunnerError('解析图片名称不安全。')
+                if not isinstance(value, str) or ';base64,' not in value:
+                    raise MinerURunnerError('解析图片编码不支持。')
+                target = out_dir / 'images' / name
+                target.parent.mkdir(exist_ok=True)
+                target.write_bytes(base64.b64decode(value.split(';base64,', 1)[1], validate=True))
+            return True
     markdown = _first_json_value(
         data,
         (
+            'md_content',
             "full_md",
             "markdown",
             "md",

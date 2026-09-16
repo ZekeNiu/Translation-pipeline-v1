@@ -15,6 +15,8 @@ def parse_custom(source, base, key, root, *, mode='auto', timeout=180, max_wait=
     source = Path(source).resolve()
     base = base.rstrip('/')
     options = dict(parse_options or {})
+    if source.suffix.lower() != '.pdf' and options.get('max_bytes') and source.stat().st_size > options['max_bytes']:
+        raise ValueError('文件超过自建服务体积上限，请先转换为 PDF 后分片。')
     if not managed and needs_parts(source, options):
         return managed_parse(source, root, {'backend': 'custom', 'url': base, 'mode': mode},
             lambda part, directory, _: parse_custom(part, base, key, directory, mode=mode, timeout=timeout, max_wait=max_wait,
@@ -42,12 +44,14 @@ def parse_custom(source, base, key, root, *, mode='auto', timeout=180, max_wait=
             if not state.get('task_id'):
                 modes = ['file_parse', 'tasks'] if mode == 'auto' else [mode]
                 # A verified health endpoint indicates the modern async protocol.
-                if mode == 'auto' and hasattr(session, 'get'):
+                if hasattr(session, 'get'):
                     try:
                         health = session.get(base + '/health', headers=_auth_headers(key), timeout=min(timeout, 5))
                         try:
                             if health.status_code == 200 and health.json().get('protocol_version'):
-                                modes = ['tasks', 'file_parse']
+                                state['modern_api'] = True
+                                if mode == 'auto':
+                                    modes = ['tasks', 'file_parse']
                         finally:
                             health.close()
                     except (requests.RequestException, ValueError, AttributeError):
@@ -59,8 +63,9 @@ def parse_custom(source, base, key, root, *, mode='auto', timeout=180, max_wait=
                     emit('正在上传到自建 MinerU；请求结果未知时不会自动重复提交。')
                     try:
                         with source.open('rb') as fh:
+                            extra = {'data': {'return_md': 'true', 'return_content_list': 'true', 'return_images': 'true'}} if state.get('modern_api') else {}
                             response = session.post(base + '/' + selected, headers=_auth_headers(key),
-                                files={'file': (source.name, fh, 'application/octet-stream')}, timeout=timeout)
+                                files={'files' if state.get('modern_api') else 'file': (source.name, fh, 'application/octet-stream')}, timeout=timeout, **extra)
                     except requests.RequestException:
                         state['status'] = 'submission_unknown'
                         write_json(path, state)

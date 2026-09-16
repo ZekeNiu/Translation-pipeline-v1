@@ -11,6 +11,25 @@ from task_state import write_json, read_json, TaskCancelled
 
 
 class LongParseTests(unittest.TestCase):
+    def test_local_soft_target_does_not_override_split_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = make_pdf(Path(td) / 'book.pdf', 200)
+            self.assertFalse(needs_parts(source, {'threshold_pages': 256, 'max_pages': 192}))
+            self.assertTrue(needs_parts(source, {'threshold_pages': 256, 'max_pages': 192, 'service_max_pages': 100}))
+    def test_modern_api_json_keeps_images_and_locations(self):
+        import base64
+        from mineru_runner import _write_markdown_from_json
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            result = {'results': {'sample': {'md_content': 'Text\n![](images/a.png)',
+                'content_list': '[{"text":"Text","page_idx":0}]',
+                'images': {'a.png': 'data:image/png;base64,' + base64.b64encode(b'png').decode()}}}}
+            self.assertTrue(_write_markdown_from_json(result, out))
+            self.assertEqual((out / 'images/a.png').read_bytes(), b'png')
+            self.assertEqual(read_json(out / 'content_list.json')[0]['page_idx'], 0)
+            result['results']['sample']['images'] = {'../private.png': 'data:image/png;base64,cG5n'}
+            with self.assertRaises(RuntimeError):
+                _write_markdown_from_json(result, out)
     def test_thousand_pages_cover_once_and_check_chapter_edges(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
