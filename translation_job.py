@@ -1,5 +1,6 @@
 """Durable orchestration around the existing translation functions."""
 from __future__ import annotations
+from task_paths import artifact, translation_lock, public_markdown
 import concurrent.futures
 from dataclasses import asdict, replace
 import os
@@ -52,7 +53,7 @@ def _copy_images(text, source, output):
             continue
         relative = Path(link.removeprefix("./"))
         original = (source / relative).resolve()
-        target = (output / relative).resolve()
+        target = (output / "_internal" / relative).resolve()
         if not original.is_relative_to(source.resolve()) or not target.is_relative_to(output.resolve()) or not original.is_file():
             missing.append({"path": link, "reason": "图片不存在或路径超出文档目录"})
             continue
@@ -63,7 +64,7 @@ def _copy_images(text, source, output):
 
 
 def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=None, speed_mode=None,
-            max_workers=None, cancel_event=None, parse_seconds=0, glossary=None, source_info=None):
+            max_workers=None, cancel_event=None, parse_seconds=0, glossary=None, source_info=None, export_options=None):
     from glossary import GlossaryMatcher, GlossarySnapshot
     snapshot = glossary or GlossarySnapshot()
     config = replace(config, glossary=GlossaryMatcher(snapshot))
@@ -88,7 +89,7 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
     if not output_dir and not out.exists():
         # A better display name must not abandon an existing task's request cache.
         for candidate in sorted(engine.OUTPUT_ROOT.glob(f"*_{identity[:20]}")):
-            saved = read_json(candidate / "task_state.json", {})
+            saved = read_json(artifact(candidate, 'task_state.json'), {})
             if isinstance(saved, dict) and saved.get("identity") == identity:
                 out = candidate
                 break
@@ -97,8 +98,10 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
     def progress(message, **info):
         if progress_callback:
             progress_callback({"msg": redact(message, [config.api_key]), **info})
-    with task_lock(out):
-        state_path = out / "task_state.json"
+    with translation_lock(out):
+        if export_options is not None:
+            write_json(artifact(out, 'export_options.json'), {'version': 1, **export_options})
+        state_path = artifact(out, 'task_state.json')
         state = read_json(state_path, {})
         if not isinstance(state, dict):
             state = {}
@@ -108,11 +111,11 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
         if state.get("identity") != identity:
             # Preserve prior explicit-directory artifacts before adopting a different source/configuration.
             if state.get("identity"):
-                previous = out / "_previous" / state["identity"][:20]
+                previous = artifact(out, '_previous') / state["identity"][:20]
                 previous.mkdir(parents=True, exist_ok=True)
                 for name in ("translated.md", "translated.docx", "quality_report.json", "quality_report.md", "task_state.json", "review_document.json", "review_edits.json", "glossary_snapshot.json", "source_document.json"):
-                    if (out / name).is_file():
-                        shutil.copy2(out / name, previous / name)
+                    if artifact(out, name).is_file():
+                        shutil.copy2(artifact(out, name), previous / name)
             state = {"version": 3, "identity": identity, "source_hash": document_hash, "config_hash": config_hash, "segments": {}}
         state['review_version'] = 1
         if state.get("checks_version") != 2:
@@ -120,11 +123,11 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
             state["segments"] = {}
             state["checks_version"] = 2
         state.update(status="running", source=str(source), provider=config.provider_name, model=config.model)
-        write_json(out / "glossary_snapshot.json", snapshot.to_dict())
+        write_json(artifact(out, 'glossary_snapshot.json'), snapshot.to_dict())
         if source_info:
-            write_json(out / "source_document.json", source_info)
+            write_json(artifact(out, 'source_document.json'), source_info)
         elif (root / 'source_document.json').is_file():
-            write_json(out / 'source_document.json', read_json(root / 'source_document.json', {}))
+            write_json(artifact(out, 'source_document.json'), read_json(root / 'source_document.json', {}))
         write_json(state_path, state)
         progress(f"译文完成后保存到：{out}", stage="prepare", output_dir=str(out), artifact_ready=False)
         try:
@@ -144,7 +147,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
              progress, speed_mode, max_workers, cancel_event, parse_seconds):
     metrics = []
     config = replace(config, cancel_event=cancel_event, metrics=metrics)
-    cache_dir = out / "_cache"
+    cache_dir = artifact(out, '_cache')
     cache_dir.mkdir(exist_ok=True)
     references_original, references_normalized, reference_reports, prepared = [], [], [], []
     original_blocks = blocks(raw)
@@ -157,13 +160,13 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
             reference_reports.append(report)
         prepared.append(text)
     if references_original:
-        atomic_write(out / "references_original.md", "\n\n".join(references_original))
-        atomic_write(out / "references_normalized.md", "\n\n".join(references_normalized))
+        atomic_write(artifact(out, "references_original.md"), "\n\n".join(references_original))
+        atomic_write(artifact(out, "references_normalized.md"), "\n\n".join(references_normalized))
     else:
         for name in ("references_original.md", "references_normalized.md"):
-            (out / name).unlink(missing_ok=True)
+            artifact(out, name).unlink(missing_ok=True)
     if sidecar.has_data:
-        write_sidecar_summary(sidecar, out / "mineru_structure_summary.json")
+        write_sidecar_summary(sidecar, artifact(out, 'mineru_structure_summary.json'))
     segments = engine.split_body_into_segments("\n\n".join(prepared))
     excerpts = [_excerpt(s) for s in segments]
     chapters, chapter = [], ""
@@ -189,7 +192,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     table_reports, warnings, pending = [], [], []
     for i, seg_id in enumerate(ids):
         record = state["segments"][seg_id]
-        path = out / "_chunks" / f"{seg_id}.md"
+        path = artifact(out, '_chunks') / f"{seg_id}.md"
         if record.get("status") in {"completed", "needs_review"} and path.is_file() and file_hash(path) == record.get("output_hash"):
             translations[i] = path.read_text(encoding="utf-8")
             warnings.extend(record.get("warnings", []))
@@ -282,7 +285,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                     failures = any(r["failures"] for r in tables)
                     review = bool(issues) or any(r["residual_english"] or r["inline_artifacts"] or r.get("glossary_warnings") for r in tables)
                     status = "failed" if failures else "needs_review" if review else "completed"
-                    path = out / "_chunks" / f"{ids[index]}.md"
+                    path = artifact(out, '_chunks') / f"{ids[index]}.md"
                     atomic_write(path, translated)
                     record.update(status=status, output_hash=file_hash(path), warnings=issues, tables=tables, seconds=ts + bs, alignment=alignments)
                     if not failures:
@@ -310,12 +313,15 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                     excerpts[i - 1][-300:] if i else '', excerpts[i + 1][:300] if i + 1 < len(ids) else '', chapters[i], i + 1, len(ids))
             except (engine.OfflineCacheMiss, ValueError, TypeError):
                 pass  # Older tasks remain readable even when exact alignment cannot be recovered offline.
-    document = make_document(state, segments, translations, chapters, sidecar, read_json(out / 'source_document.json', {}), config)
-    write_json(out / 'review_document.json', document)
+    document = make_document(state, segments, translations, chapters, sidecar, read_json(artifact(out, 'source_document.json'), {}), config)
+    from review import enrich_document
+    enrich_document(out, document)
+    write_json(artifact(out, 'review_document.json'), document)
     edits = load_edits(out, state['identity'])
     manual_issues = edit_issues(document, edits)
     result = render_document(document, edits)
     missing_images = _copy_images(result, root, out)
+    result = public_markdown(result)
     parse_report = read_json(root / "parse_report.json", {})
     parse_warnings = parse_report.get("warnings", [])
     failed = [i + 1 for i, key in enumerate(ids) if state["segments"][key].get("status") not in {"completed", "needs_review"}]
@@ -330,15 +336,14 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
     docx, export_error, export_warnings = out / "translated.docx", None, []
     try:
         from make_docx import make_docx
-        temporary_docx = out / "translated.docx.tmp"
-        export_warnings = make_docx(result, temporary_docx, out) or []
+        temporary_docx = artifact(out, "translated.docx.tmp")
+        from export_layout import prepare_layout
+        export_warnings = make_docx(result, temporary_docx, out, layout=prepare_layout(out, document)) or []
         os.replace(temporary_docx, docx)
         if export_warnings and status == "completed":
             status = "needs_review"
     except Exception as exc:
         export_error = redact(exc, [config.api_key])
-        if docx.exists():
-            os.replace(docx, out / "previous_translated.docx")
         docx = None
         status = "partial_failed"
     report = {"status": status, "failed_segments": failed, "warnings": warnings, "tables": table_reports,
@@ -353,44 +358,11 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                            "prompt_chars": sum(m.get("glossary_chars", 0) for m in metrics),
                            "retry_requests": sum(bool(m.get("retry")) for m in metrics),
                            "book_extraction_requests": list(config.glossary.snapshot.extraction_requests)}}
-    write_json(out / "quality_report.json", report)
-    lines = ["# 翻译质量报告", "", {"completed": "完成：自动检查未发现需要处理的问题。", "needs_review": "完成，但有待检查项。", "partial_failed": "部分失败；失败段落保留原文，可继续任务重试。"}[status],
-             "", f"共 {len(ids)} 段；本次模型请求 {len(metrics)} 次。", "", "自动检查用于发现结构问题与疑点，不等同于人工语义审校。"]
-    lines.extend(["", f"术语命中（按分段累计）：{report['glossary']['matched_terms']}；本次请求附加术语字符：{report['glossary']['prompt_chars']}；本次修订请求：{report['glossary']['retry_requests']}。"] )
-    lines.append(f"本书累计术语提取请求：{len(config.glossary.snapshot.extraction_requests)}。服务返回的逐次用量见 JSON 报告。")
-    for item in manual_issues:
-        lines.append(f"- 人工修订 {item['unit']}：" + '；'.join(item['issues']))
-    if failed:
-        lines.extend(["", "未完成段落：" + ", ".join(map(str, failed))])
-        for i in failed:
-            record = state["segments"][ids[i - 1]]
-            lines.append(f"- 第 {i} 段：{record.get('error', '表格部分单元格未完成或任务尚未执行')}")
-    for issue in warnings:
-        lines.append(f"- 第 {issue['segment']} 段：" + "；".join(issue["phrases"]))
-    for issue in parse_warnings:
-        lines.append(f"- 原文页码 {issue.get('pages')}：{issue.get('reason')}")
-    for issue in missing_images:
-        lines.append(f"- 图片 {issue['path']}：{issue['reason']}")
-    table_numbers = {}
-    for table in table_reports:
-        table_numbers[table['segment']] = table_numbers.get(table['segment'], 0) + 1
-        if table["failures"] or table["residual_english"] or table["inline_artifacts"] or table.get("glossary_warnings"):
-            details = list(table.get("glossary_warnings", []))
-            if table['failures']:
-                details.append(f"{len(table['failures'])} 个单元格未完成")
-            if table['residual_english']:
-                details.append('英文候选（可能是专名）：' + '、'.join(table['residual_english'][:3]))
-            if table['inline_artifacts']:
-                details.append('格式标记需核对')
-            lines.append(f"- 第 {table['segment']} 段，表格 {table_numbers[table['segment']]}：" + '；'.join(details))
-    if artifacts:
-        lines.append("- 公式存在未处理标记，请核对：" + ", ".join(artifacts[:10]))
-    if export_error:
-        lines.append("- Word 导出失败：" + export_error)
-    for warning in export_warnings:
-        lines.append("- " + warning)
-    atomic_write(out / "quality_report.md", "\n".join(lines) + "\n")
-    atomic_write(out / "translation.log", f"Source: {source}\nProvider: {config.provider_name}\nModel: {config.model}\n"
+    write_json(artifact(out, 'quality_report.json'), report)
+    from quality_report import write_reports
+    write_reports(out, document, edits, report)
+    status = report['status']
+    atomic_write(artifact(out, 'translation.log'), f"Source: {source}\nProvider: {config.provider_name}\nModel: {config.model}\n"
                  f"Header/footer/page lines removed: {excluded}\nReference normalization: {reference_reports}\n" +
                  redact(str(report), [config.api_key]))
     state.update(status=status, quality_report="quality_report.json")

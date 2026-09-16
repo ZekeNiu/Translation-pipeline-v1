@@ -1,3 +1,4 @@
+from task_paths import artifact
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -212,7 +213,7 @@ class JobTests(unittest.TestCase):
         with patch('translate.call_chat_completion', side_effect=fake), patch('translation_job.time.monotonic', side_effect=itertools.count(0, 11).__next__):
             translate.run(self.root, self.out, progress_callback=progress, **self.kw)
         self.assertTrue(any('等待' in e['msg'] and e.get('log') is False for e in events))
-        self.assertEqual(read_json(self.out / 'quality_report.json')['status'], 'completed')
+        self.assertEqual(read_json(artifact(self.out, 'quality_report.json'))['status'], 'completed')
 
     def test_cli_returns_failure_status_for_partial_output(self):
         import io
@@ -263,14 +264,14 @@ class JobTests(unittest.TestCase):
         default = Path(self.temp.name) / 'default'
         with patch('translate.OUTPUT_ROOT', default), patch('translate.call_chat_completion', side_effect=echo_source) as call:
             first, _ = translate.run(self.root, **self.kw)
-            state = read_json(first.parent / 'task_state.json')
+            state = read_json(artifact(first.parent, 'task_state.json'))
             state.pop('checks_version')
-            write_json(first.parent / 'task_state.json', state)
+            write_json(artifact(first.parent, 'task_state.json'), state)
             write_json(self.root.parent / 'parse_state.json', {'source_name': 'Actual report.pdf'})
             second, _ = translate.run(self.root, **self.kw)
         self.assertEqual(first, second)
         self.assertEqual(call.call_count, 1)
-        self.assertEqual(read_json(first.parent / 'task_state.json')['checks_version'], 2)
+        self.assertEqual(read_json(artifact(first.parent, 'task_state.json'))['checks_version'], 2)
 
     def test_failed_segment_only_is_retried(self):
         parts = ['# First\n\nShort text.', '# Second\n\nOther text.']
@@ -283,12 +284,12 @@ class JobTests(unittest.TestCase):
             return '' if fail and '# Second' in source else source
         with patch('translate.split_body_into_segments', return_value=parts), patch('translate.call_chat_completion', side_effect=fake):
             translate.run(self.root, self.out, **self.kw)
-            self.assertEqual(read_json(self.out / 'quality_report.json')['status'], 'partial_failed')
+            self.assertEqual(read_json(artifact(self.out, 'quality_report.json'))['status'], 'partial_failed')
             count = len(seen)
             fail = False
             translate.run(self.root, self.out, **self.kw)
         self.assertTrue(all('# First' not in value for value in seen[count:]))
-        self.assertFalse(read_json(self.out / 'quality_report.json')['failed_segments'])
+        self.assertFalse(read_json(artifact(self.out, 'quality_report.json'))['failed_segments'])
 
     def test_stop_preserves_completed_request_for_resume(self):
         self.source.write_text('# Title\n\nSimple text.', encoding='utf-8')
@@ -299,7 +300,7 @@ class JobTests(unittest.TestCase):
         with patch('translate.call_chat_completion', side_effect=fake):
             with self.assertRaises(TaskCancelled):
                 translate.run(self.root, self.out, cancel_event=event, **self.kw)
-        self.assertEqual(read_json(self.out / 'task_state.json')['status'], 'stopped')
+        self.assertEqual(read_json(artifact(self.out, 'task_state.json'))['status'], 'stopped')
         event.clear()
         with patch('translate.call_chat_completion', side_effect=AssertionError('completed chunk should be reused')):
             translate.run(self.root, self.out, cancel_event=event, **self.kw)
@@ -312,13 +313,13 @@ class JobTests(unittest.TestCase):
             translate.run(self.root, self.out, **self.kw)
         self.assertEqual(call.call_count, 2)
         self.assertIn('Different text.', (self.out / 'translated.md').read_text())
-        self.assertTrue(list((self.out / '_previous').glob('*/translated.md')))
+        self.assertTrue(list((artifact(self.out, '_previous')).glob('*/translated.md')))
 
     def test_corrupt_completed_chunk_uses_valid_request_cache(self):
         self.source.write_text('Text.', encoding='utf-8')
         with patch('translate.call_chat_completion', side_effect=echo_source) as call:
             translate.run(self.root, self.out, **self.kw)
-            next((self.out / '_chunks').glob('*.md')).write_text('broken')
+            next((artifact(self.out, '_chunks')).glob('*.md')).write_text('broken')
             translate.run(self.root, self.out, **self.kw)
         self.assertEqual(call.call_count, 1)
         self.assertIn('Text.', (self.out / 'translated.md').read_text())

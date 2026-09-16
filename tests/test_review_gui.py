@@ -17,6 +17,8 @@ class ReviewGuiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        import gc
+        self.addCleanup(gc.collect)
         self.path = Path(self.temp.name)
         self.root = tk.Tk()
         self.root.withdraw()

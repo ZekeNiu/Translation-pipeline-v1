@@ -1,4 +1,5 @@
 """Bilingual text review with explicit candidate adoption and export-only retry."""
+from task_paths import artifact, translation_lock, public_markdown
 from pathlib import Path
 import os
 import queue
@@ -9,7 +10,10 @@ from tkinter import messagebox, scrolledtext, ttk
 from glossary import GlossaryMatcher, GlossarySnapshot
 from review import (all_units, effective_text, load_edits, save_edit, reexport, propose_translation,
                     extract_original_page, validate_edit, recover_existing, current_glossary)
+from review import confirm_unit, propose_omission, adopt_omission, omission_unit
+from quality_report import active_issues, suggestion
 from task_state import read_json, fingerprint, redact
+from task_state import write_json
 
 
 class ReviewWindow:
@@ -31,6 +35,17 @@ class ReviewWindow:
         ttk.Button(top, text='刷新', command=self.load).pack(side='left', padx=6)
         self.status = ttk.Label(top, text='')
         self.status.pack(side='left', padx=12)
+        settings = ttk.Frame(self.window, padding=(10, 0))
+        settings.pack(fill='x')
+        ttk.Label(settings, text='页眉页脚').pack(side='left')
+        from export_layout import MODES
+        self.layout_mode = tk.StringVar(value=MODES.get(read_json(artifact(self.out, 'export_options.json'), {}).get('header_mode', 'original'), '保留原样式'))
+        ttk.Combobox(settings, values=list(MODES.values()), textvariable=self.layout_mode, state='readonly', width=14).pack(side='left', padx=5)
+        for text, callback in [('预览样式', self.preview), ('应用样式并导出', self.apply_layout), ('打开质量报告', self.open_report)]:
+            button = ttk.Button(settings, text=text, command=callback)
+            button.pack(side='left', padx=5)
+            if text != '打开质量报告':
+                self.controls.append(button)
         listing = ttk.Frame(self.window)
         listing.pack(fill='x', padx=10)
         self.tree = ttk.Treeview(listing, columns=('section', 'page', 'kind', 'issue'), show='headings', height=8, selectmode='browse')
@@ -55,13 +70,13 @@ class ReviewWindow:
         self.reason.pack(fill='x', padx=10)
         bar = ttk.Frame(self.window, padding=10)
         bar.pack(fill='x')
-        for label, callback in [('保存并重新导出', self.save), ('恢复上一版', self.restore), ('只重译选中项', self.retranslate),
+        for index, (label, callback) in enumerate([('保存并重新导出', self.save), ('恢复上一版', self.restore), ('只重译选中项', self.retranslate),
                                 ('重新导出', lambda: self.action('export', lambda: reexport(self.out))),
-                                ('离线恢复对应记录', self.recover)]:
+                                ('离线恢复对应记录', self.recover), ('确认保留', self.confirm), ('恢复漏段', self.retranslate)]):
             button = ttk.Button(bar, text=label, command=callback)
-            button.pack(side='left', padx=4)
+            button.grid(row=index // 4, column=index % 4, padx=4, pady=3, sticky='ew')
             self.controls.append(button)
-        ttk.Button(bar, text='查看原 PDF 页', command=self.open_page).pack(side='right')
+        ttk.Button(bar, text='查看原 PDF 页', command=self.open_page).grid(row=1, column=3, padx=4)
         self.window.protocol('WM_DELETE_WINDOW', self.close)
         self.load()
         self.timer = self.window.after(100, self.poll)
@@ -69,25 +84,24 @@ class ReviewWindow:
     def load(self):
         if self.working:
             return
-        self.document = read_json(self.out / 'review_document.json', {})
+        self.document = read_json(artifact(self.out, 'review_document.json'), {})
         if not self.document or self.document.get('version') != 1:
             self.status.configure(text='旧任务缺少对应记录；可点击“离线恢复对应记录”。')
             return
         self.edits = load_edits(self.out, self.document['identity'])
         self.revision = fingerprint(self.document, self.edits)
         self.units = [u for u in all_units(self.document) if u['kind'] != 'table' or not u.get('cells')]
+        recovered = {u.get('omission_id') for u in self.units}
+        self.units.extend({**i, 'kind': 'omission', 'chapter': '解析遗漏检查', 'translated': '',
+                           'source_hash': fingerprint(i['source']), 'issues': [i['reason']]}
+                          for i in self.document.get('omissions', []) if i['id'] not in recovered)
         self.refresh_list()
         self.status.configure(text=f"共 {len(self.units)} 项；人工修订 {len(self.edits['edits'])} 项。")
 
     def issues(self, unit):
-        record = self.edits['edits'].get(unit['id'], {})
-        if record.get('history') and record.get('source_hash') == unit['source_hash']:
-            last = record['history'][-1]
-            issues = list(last.get('issues', []))
-            if last.get('glossary_terms', []) != unit.get('glossary_terms', []):
-                issues.append('术语已变化，人工译文已保留')
-            return issues
-        return unit.get('issues', [])
+        if unit['kind'] == 'omission':
+            return unit['issues']
+        return active_issues(unit, self.edits)
 
     def refresh_list(self):
         if self.working:
@@ -100,7 +114,7 @@ class ReviewWindow:
             if self.filter.get() and not issues:
                 continue
             self.tree.insert('', 'end', iid=unit['id'], values=(unit['chapter'] + ' · ' + unit['source'][:60],
-                unit.get('page') or '未定位', labels.get(unit['kind'], unit['kind']), '；'.join(issues) or ''))
+                '、'.join(map(str, unit['pages'])) if unit.get('pages') else unit.get('page') or '未定位', labels.get(unit['kind'], unit['kind']), '；'.join(issues) or ''))
         if self.current and self.tree.exists(self.current):
             self.tree.selection_set(self.current)
 
@@ -122,7 +136,44 @@ class ReviewWindow:
         self.target.delete('1.0', 'end')
         self.target.insert('1.0', effective_text(unit, self.edits))
         self.displayed_text = effective_text(unit, self.edits)
-        self.reason.configure(text='；'.join(self.issues(unit)) or '自动检查未发现问题；仍需结合原文判断语义。')
+        issues = self.issues(unit)
+        self.reason.configure(text=f"编号 {unit['id']} · " + ('；'.join(issues) + '\n建议：' + suggestion(issues[0]) if issues else '自动检查未发现问题；仍需结合原文判断语义。'))
+
+    def confirm(self):
+        try:
+            unit, revision = self.selected(), self.revision
+            if unit['kind'] == 'omission':
+                raise ValueError('漏段请先核对原页，不能以确认保留代替恢复。')
+            self.action('saved', lambda: confirm_unit(self.out, unit['id'], expected_revision=revision))
+        except Exception as exc:
+            messagebox.showerror('不能确认', str(exc), parent=self.window)
+
+    def layout_options(self):
+        from export_layout import MODES
+        return {'header_mode': next(k for k, v in MODES.items() if v == self.layout_mode.get())}
+
+    def preview(self):
+        from export_layout import preview_layout
+        options = self.layout_options()
+        def work():
+            with translation_lock(self.out):
+                return preview_layout(self.out, self.document, options)
+        self.action('preview', work)
+
+    def apply_layout(self):
+        options = self.layout_options()
+        def work():
+            with translation_lock(self.out):
+                write_json(artifact(self.out, 'export_options.json'), {'version': 1, **options})
+            reexport(self.out)
+        self.action('export', work)
+
+    def open_report(self):
+        path = self.out / 'quality_report.html'
+        if path.exists():
+            os.startfile(path)
+        else:
+            self.status.configure(text='请先重新导出以生成可定位报告。')
 
     def selected(self):
         if not self.current:
@@ -148,11 +199,15 @@ class ReviewWindow:
             unit = self.selected()
             text = self.target.get('1.0', 'end-1c')
             matcher = GlossaryMatcher(current_glossary(self.out))
-            issues = validate_edit(unit, text) + matcher.issues(unit['source'], text)
+            checked = omission_unit(self.document, unit['id']) if unit['kind'] == 'omission' else unit
+            issues = validate_edit(checked, text) + matcher.issues(unit['source'], text)
             if issues and not messagebox.askyesno('仍有待核对项', '\n'.join(issues) + '\n\n仍然保留此修订？', parent=self.window):
                 return
             revision = self.revision
-            self.action('saved', lambda: save_edit(self.out, unit['id'], text, allow_warnings=True, expected_revision=revision))
+            if unit['kind'] == 'omission':
+                self.action('saved', lambda: adopt_omission(self.out, unit['id'], text, expected_revision=revision))
+            else:
+                self.action('saved', lambda: save_edit(self.out, unit['id'], text, allow_warnings=True, expected_revision=revision))
         except Exception as exc:
             messagebox.showerror('未保存', str(exc), parent=self.window)
 
@@ -169,7 +224,7 @@ class ReviewWindow:
             config = self.config_for(self.document)
             def propose():
                 try:
-                    return propose_translation(self.out, unit['id'], config)
+                    return (propose_omission if unit['kind'] == 'omission' else propose_translation)(self.out, unit['id'], config)
                 except Exception as exc:
                     raise ValueError(redact(exc, [config.api_key])) from None
             self.action('candidate', propose)
@@ -206,6 +261,9 @@ class ReviewWindow:
                 self.target.delete('1.0', 'end')
                 self.target.insert('1.0', value)
                 self.status.configure(text='重译候选已生成；点击“保存并重新导出”后采用。')
+            elif kind == 'preview':
+                os.startfile(value)
+                self.status.configure(text='样式预览已打开；应用样式并导出后更新成品。')
             else:
                 self.load()
                 self.status.configure(text='已保存；导出文件及质量报告已更新。' if kind != 'recovered' else '离线恢复结束；未调用模型。')

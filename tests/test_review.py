@@ -1,3 +1,4 @@
+from task_paths import artifact
 import json
 from pathlib import Path
 import re
@@ -36,7 +37,7 @@ class ReviewTests(unittest.TestCase):
             return translate.run(self.source, self.out, **self.kwargs, **kwargs)
 
     def units(self):
-        return list(all_units(read_json(self.out / 'review_document.json')))
+        return list(all_units(read_json(artifact(self.out, 'review_document.json'))))
 
     def test_manual_edit_survives_resume_and_restore(self):
         self.md.write_text('Force 3.\n\nOther 4.', encoding='utf-8')
@@ -48,7 +49,7 @@ class ReviewTests(unittest.TestCase):
         self.assertIn('测得力为 3。', (self.out / 'translated.md').read_text(encoding='utf-8'))
         save_edit(self.out, unit['id'], '', restore=True, allow_warnings=True)
         self.assertIn(unit['translated'], (self.out / 'translated.md').read_text(encoding='utf-8'))
-        self.assertTrue(list((self.out / '_review_history').glob('*/translated.docx')))
+        self.assertTrue(list((artifact(self.out, '_review_history')).glob('*/translated.docx')))
 
     def test_formula_structure_cannot_be_overwritten(self):
         self.md.write_text('Force $x^2$ is 3.', encoding='utf-8')
@@ -56,7 +57,7 @@ class ReviewTests(unittest.TestCase):
         unit = self.units()[0]
         with self.assertRaisesRegex(ValueError, '结构|公式'):
             save_edit(self.out, unit['id'], '力 $y^2$ 为 3。', allow_warnings=True)
-        self.assertFalse((self.out / 'review_edits.json').exists())
+        self.assertFalse((artifact(self.out, 'review_edits.json')).exists())
 
     def test_numeric_warning_requires_explicit_acceptance(self):
         self.md.write_text('Force 3.', encoding='utf-8')
@@ -65,7 +66,7 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '数字'):
             save_edit(self.out, unit['id'], '力为 4。')
         save_edit(self.out, unit['id'], '力为 4。', allow_warnings=True)
-        self.assertEqual(read_json(self.out / 'quality_report.json')['status'], 'needs_review')
+        self.assertEqual(read_json(artifact(self.out, 'quality_report.json'))['status'], 'needs_review')
 
     def test_export_failure_retains_edit_and_can_retry_without_model(self):
         self.md.write_text('Force 3.', encoding='utf-8')
@@ -76,10 +77,10 @@ class ReviewTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 save_edit(self.out, unit['id'], '测得力为 3。')
         self.assertEqual((self.out / 'translated.docx').read_bytes(), previous)
-        self.assertTrue(read_json(self.out / 'quality_report.json')['review_export_pending'])
+        self.assertTrue(read_json(artifact(self.out, 'quality_report.json'))['review_export_pending'])
         with patch('translate.call_chat_completion', side_effect=AssertionError('No model on export')):
             reexport(self.out)
-        self.assertFalse(read_json(self.out / 'quality_report.json')['review_export_pending'])
+        self.assertFalse(read_json(artifact(self.out, 'quality_report.json'))['review_export_pending'])
         self.assertIn('测得力为 3。', (self.out / 'translated.md').read_text(encoding='utf-8'))
 
     def test_duplicate_paragraphs_are_separate_and_table_cell_edit_preserves_spans(self):
@@ -115,16 +116,16 @@ class ReviewTests(unittest.TestCase):
         terms = GlossarySnapshot(True, False, ({'source': 'Force', 'target': '力量', 'note': ''},))
         self.run_job(glossary=terms)
         self.assertIn('测得力为 3。', (self.out / 'translated.md').read_text(encoding='utf-8'))
-        self.assertTrue(read_json(self.out / 'quality_report.json')['manual_review'])
+        self.assertTrue(read_json(artifact(self.out, 'quality_report.json'))['manual_review'])
 
     def test_offline_recovery_uses_validated_caches(self):
         self.md.write_text('Force 3.', encoding='utf-8')
         self.run_job()
-        state = read_json(self.out / 'task_state.json')
+        state = read_json(artifact(self.out, 'task_state.json'))
         for record in state['segments'].values():
             record.pop('alignment')
-        write_json(self.out / 'task_state.json', state)
-        (self.out / 'review_document.json').unlink()
+        write_json(artifact(self.out, 'task_state.json'), state)
+        (artifact(self.out, 'review_document.json')).unlink()
         with patch('translate.http_request', side_effect=AssertionError('No network during recovery')):
             document = recover_existing(self.out, self.config)
         self.assertEqual(next(all_units(document))['kind'], 'text')
@@ -156,9 +157,9 @@ class ReviewTests(unittest.TestCase):
         self.md.write_text('Force 3.', encoding='utf-8')
         self.run_job()
         unit = self.units()[0]
-        document = read_json(self.out / 'review_document.json')
+        document = read_json(artifact(self.out, 'review_document.json'))
         revision = fingerprint(document, load_edits(self.out, document['identity']))
-        with task_lock(self.out):
+        with task_lock(self.out / "_internal"):
             with self.assertRaises(RuntimeError):
                 save_edit(self.out, unit['id'], '力为 3。')
         save_edit(self.out, unit['id'], '力为 3。', expected_revision=revision)

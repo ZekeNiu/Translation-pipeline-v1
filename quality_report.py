@@ -21,8 +21,8 @@ def active_issues(unit, edits):
         issues.extend(i for i in unit.get('issues', []) if '未完成' in i or '对应' in i or '结构' in i)
         terms = unit.get('glossary_terms', [])
         if terms:
-            # Existing glossary warnings are refreshed by save/retranslation; keep them for unedited units.
-            issues.extend(i for i in unit.get('issues', []) if '术语' in i)
+            matcher = GlossaryMatcher(GlossarySnapshot(book_enabled=True, book_entries=tuple(terms)))
+            issues.extend(matcher.issues(unit['source'], text))
         if record.get('history') and record['history'][-1].get('glossary_terms', []) != terms:
             issues.append('术语已变化，人工译文已保留')
     issues = list(dict.fromkeys(issues))

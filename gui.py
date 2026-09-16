@@ -1,5 +1,6 @@
 """Compact desktop workflow. Workers only communicate through a queue."""
 from __future__ import annotations
+from task_paths import artifact, translation_lock, public_markdown
 import os
 from pathlib import Path
 import queue
@@ -73,7 +74,8 @@ class App:
         self._field(self.advanced_frame, "并发模式", "speed_mode", "balanced", 0, ["safe", "balanced", "fast"])
         self._field(self.advanced_frame, "译文目录（可选）", "output_dir", "", 1)
         self._field(self.advanced_frame, "解析文件目录", "mineru_output", mineru.get("output", str(DEFAULT_MINERU_OUTPUT_ROOT)), 2)
-        self.cli_frame = self._frame(self.advanced_frame, "本地 MinerU", 3)
+        self._field(self.advanced_frame, "页眉页脚", "header_mode", "保留原样式", 3, ["保留原样式", "简洁样式", "关闭"])
+        self.cli_frame = self._frame(self.advanced_frame, "本地 MinerU", 4)
         self.cli_frame.grid(columnspan=3)
         self._field(self.cli_frame, "程序路径", "mineru_exe", mineru.get("executable", ""), 0)
         ttk.Button(self.cli_frame, text="检测环境", command=self._detect_mineru).grid(row=0, column=2, padx=8)
@@ -162,7 +164,7 @@ class App:
         self._capture_provider()
         values = self._snapshot()
         # Never persist top-level plaintext fields from the worker snapshot.
-        self.settings = {k: values[k] for k in ("provider", "source_mode", "input_path", "speed_mode", "output_dir")}
+        self.settings = {k: values[k] for k in ("provider", "source_mode", "input_path", "speed_mode", "output_dir", "header_mode")}
         self.settings.update(providers=self.providers, result_dir=self.result_dir,
                              mineru={"url": values["mineru_url"], "api_key": values["mineru_key"], "output": values["mineru_output"],
                                      "executable": values["mineru_exe"], "backend": values["mineru_backend"]})
@@ -283,8 +285,9 @@ class App:
                 elapsed = time.monotonic() - started
                 check_cancel(self.cancel_event)
                 md, _docx = run(folder, opts["output_dir"] or None, **{k: opts[k] for k in ("provider", "base_url", "api_key", "model", "speed_mode")},
-                                progress_callback=progress_cb, cancel_event=self.cancel_event, parse_seconds=elapsed, glossary=glossary, source_info=source_info)
-                summary = read_json(Path(md).parent / "quality_report.json", {})
+                                progress_callback=progress_cb, cancel_event=self.cancel_event, parse_seconds=elapsed, glossary=glossary, source_info=source_info,
+                                export_options={'header_mode': {'保留原样式': 'original', '简洁样式': 'simple', '关闭': 'off'}[opts['header_mode']]})
+                summary = read_json(artifact(Path(md).parent, 'quality_report.json'), {})
                 self.events.put(("done", (str(Path(md).parent), summary.get("status", "completed"))))
             except TaskCancelled as exc:
                 self.events.put(("stopped", str(exc)))
@@ -384,7 +387,7 @@ class App:
 
     def _open_review(self):
         from review_gui import ReviewWindow
-        if not self.result_dir or not (Path(self.result_dir) / "task_state.json").is_file():
+        if not self.result_dir or not (artifact(Path(self.result_dir), 'task_state.json')).is_file():
             self.progress_label.configure(text="请先完成或继续一个翻译任务，再打开复核。")
             return
         if self.review_window and self.review_window.window.winfo_exists():

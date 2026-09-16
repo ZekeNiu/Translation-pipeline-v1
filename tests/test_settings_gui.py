@@ -48,12 +48,15 @@ class GuiTests(unittest.TestCase):
         from gui import App
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        import gc
+        self.addCleanup(gc.collect)
         self.root = tk.Tk()
         self.root.withdraw()
         def cleanup():
             self.root.after_cancel(self.app.queue_timer)
             if self.app.save_timer:
                 self.root.after_cancel(self.app.save_timer)
+            self.app.vars.clear()
             self.root.destroy()
         self.addCleanup(cleanup)
         with patch.dict(os.environ, {"AI_PROVIDER": "custom", "AI_API_KEY": "", "MINERU_API_KEY": ""}):

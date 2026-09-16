@@ -215,6 +215,9 @@ def latex_formula_to_readable(expr: str, strip_delimiters: bool = True) -> str:
             expr = _strip_math_delimiters(expr)
 
         expr = expr.replace("\n", " ")
+        # OCR sometimes adds redundant plain groups such as {{t h}}.
+        for _ in range(4):
+            expr = re.sub(r'\{\s*\{([A-Za-z0-9\s]+)\}\s*\}', r'{\1}', expr)
         expr = re.sub(r"\\(?:left|right)\b", "", expr)
         expr = _replace_frac(expr)
         expr = re.sub(

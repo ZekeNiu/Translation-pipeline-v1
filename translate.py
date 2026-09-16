@@ -4,6 +4,7 @@ High-quality MinerU markdown translation with structure protection,
 OpenAI-compatible provider selection, and resumable chunk cache.
 """
 from __future__ import annotations
+from task_paths import artifact, translation_lock, public_markdown
 
 import argparse
 from dataclasses import dataclass, field, replace
@@ -1022,13 +1023,14 @@ def run(
     parse_seconds=0,
     glossary=None,
     source_info=None,
+    export_options=None,
 ):
     check_cancel(cancel_event)
     from translation_job import run_job
     config = resolve_provider_config(provider=provider, base_url=base_url, api_key=api_key,
                                      api_key_env=api_key_env, model=model, temperature=temperature, timeout=timeout)
     return run_job(sys.modules[__name__], config, input_folder, output_dir, progress_callback=progress_callback,
-                   speed_mode=speed_mode, max_workers=max_workers, cancel_event=cancel_event, parse_seconds=parse_seconds, glossary=glossary, source_info=source_info)
+                   speed_mode=speed_mode, max_workers=max_workers, cancel_event=cancel_event, parse_seconds=parse_seconds, glossary=glossary, source_info=source_info, export_options=export_options)
 
 
 def build_arg_parser():
@@ -1047,6 +1049,7 @@ def build_arg_parser():
     parser.add_argument("--max-workers", type=int, help="Override translation worker count (1-4)")
     parser.add_argument("--global-glossary", help="Explicitly enable a global glossary CSV")
     parser.add_argument("--book-glossary", help="Explicitly enable a book glossary CSV")
+    parser.add_argument("--header-mode", choices=['original', 'simple', 'off'], help="Export page furniture; does not change translation caches")
     return parser
 
 
@@ -1074,8 +1077,9 @@ def main(argv=None):
         max_workers=args.max_workers,
         progress_callback=lambda info: print(info.get("msg", ""), flush=True),
         glossary=glossary,
+        export_options={'header_mode': args.header_mode} if args.header_mode else None,
     )
-    report = read_json(md.parent / "quality_report.json", {})
+    report = read_json(artifact(md.parent, 'quality_report.json'), {})
     print(f"质量报告：{md.parent / 'quality_report.md'}")
     return 1 if report.get("status") == "partial_failed" else 0
 

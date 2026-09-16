@@ -149,7 +149,9 @@ def find_omissions(sidecar, markdown, units):
     for record in sidecar.furniture:
         text = record['text'].strip()
         key = location_key(text)
-        if (record['margin'] and not headings.match(text)) or len(text) < 8 or key in content or key in seen:
+        is_heading = bool(headings.fullmatch(text))
+        present = bool(re.search(r'(?im)^#{1,6}\s+' + re.escape(text) + r'\s*$', markdown)) if is_heading else key in content
+        if (record['margin'] and not is_heading) or len(text) < 8 or present or key in seen:
             continue
         if not (len(text.split()) >= 3 or text.isupper()):
             continue

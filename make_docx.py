@@ -14,6 +14,8 @@ try:
     from docx.shared import Pt, Inches, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
     from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.enum.section import WD_SECTION_START, WD_ORIENT
 except ImportError:
     import subprocess
 
@@ -78,6 +80,7 @@ def _paragraph(doc, text: str, size=BODY_SIZE, first_indent=True, italic=False, 
     pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
     pf.line_spacing = LINE_SPACING
     pf.space_after = Pt(2)
+    pf.widow_control = True
     _add_text_runs(p, text, size=size, bold=bold, italic=italic)
     return p
 
@@ -126,7 +129,24 @@ def _add_html_table(doc, html: str) -> bool:
                         occupied.add((r, c))
                 max_cols = max(max_cols, col_idx + colspan)
                 col_idx += colspan
+        # Estimate minimum readable widths from unbreakable words and Chinese text.
+        widths = [0.9] * max_cols
+        for _r, c, _rs, cs, cell in placements:
+            words = re.findall(r'[A-Za-z0-9_.%+-]+|[^\x00-\x7f]', re.sub('<[^>]+>', '', cell.text))
+            longest = max((len(word) for word in words), default=1)
+            need = min(5.0, max(0.9, longest * .14 + .35)) / cs
+            for column in range(c, c+cs):
+                widths[column] = max(widths[column], need)
+        landscape = max_cols >= 9 or sum(widths) > 16.6
+        if landscape:
+            section = doc.add_section(WD_SECTION_START.NEW_PAGE)
+            section.orientation = WD_ORIENT.LANDSCAPE
+            section.page_width, section.page_height = Cm(29.7), Cm(21)
+        available = 25.3 if landscape else 16.6
         table = doc.add_table(rows=len(rows), cols=max_cols)
+        table.autofit = False
+        for column, width in zip(table.columns, widths):
+            column.width = Cm(available * width / sum(widths))
         try:
             table.style = "Table Grid"
         except Exception:
@@ -137,12 +157,26 @@ def _add_html_table(doc, html: str) -> bool:
             if colspan > 1 or rowspan > 1:
                 cell = cell.merge(table.cell(row_idx + rowspan - 1, col_idx + colspan - 1))
             cell.text = ""
+            cell.width = Cm(available * sum(widths[col_idx:col_idx+colspan]) / sum(widths))
             paragraph = cell.paragraphs[0]
             paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
             paragraph.paragraph_format.line_spacing = 1.0
             paragraph.paragraph_format.space_after = Pt(0)
             _add_text_runs(paragraph, parsed_cell.text, size=TABLE_SIZE, bold=(parsed_cell.tag == "th"))
+        for index, row in enumerate(rows):
+            props = table.rows[index]._tr.get_or_add_trPr()
+            if max((len(c.text) for c in row.cells), default=0) < 600:
+                props.append(OxmlElement('w:cantSplit'))
+            explicit = all(c.tag == 'th' for c in row.cells)
+            inferred = (index == 0 and len(row.cells) >= 2 and all(not re.search(r'\d', c.text) for c in row.cells)
+                        and len(rows) > 1 and any(re.search(r'\d', c.text) for c in rows[1].cells))
+            if (explicit or inferred) and (index == 0 or table.rows[index-1]._tr.xpath('./w:trPr/w:tblHeader')):
+                props.append(OxmlElement('w:tblHeader'))
         doc.add_paragraph()
+        if landscape:
+            section = doc.add_section(WD_SECTION_START.NEW_PAGE)
+            section.orientation = WD_ORIENT.PORTRAIT
+            section.page_width, section.page_height = Cm(21), Cm(29.7)
     return True
 
 
@@ -168,7 +202,18 @@ def _add_image(doc, image_line: str, images_search_root: Path | None):
                 p = doc.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 r = p.add_run()
-                r.add_picture(str(ip), width=Inches(4.8))
+                from PIL import Image
+                with Image.open(ip) as image:
+                    width, height = image.size
+                section = doc.sections[-1]
+                max_width = section.page_width - section.left_margin - section.right_margin
+                max_width = min(max_width, Inches(width / 180))
+                max_height = section.page_height - section.top_margin - section.bottom_margin - Cm(1.7)
+                scale = min(max_width / width, max_height / height)
+                r.add_picture(str(ip), width=int(width*scale), height=int(height*scale))
+                p.paragraph_format.keep_together = True
+                if height*scale > max_height*.85:
+                    p.paragraph_format.page_break_before = True
             except Exception:
                 return f"Word 无法嵌入图片：{rel_path}"
             return None
@@ -182,6 +227,7 @@ def _configure_document(doc):
     style.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
     style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
     style.paragraph_format.line_spacing = LINE_SPACING
+    style.paragraph_format.widow_control = True
 
     for lv in range(1, 5):
         try:
@@ -194,15 +240,64 @@ def _configure_document(doc):
         hs.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
         hs.paragraph_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
         hs.paragraph_format.line_spacing = 1.3
+        hs.paragraph_format.keep_with_next = True
+        hs.paragraph_format.keep_together = True
 
     for sec in doc.sections:
-        sec.top_margin = Inches(0.8)
-        sec.bottom_margin = Inches(0.8)
-        sec.left_margin = Inches(1.0)
-        sec.right_margin = Inches(1.0)
+        sec.page_width, sec.page_height = Cm(21), Cm(29.7)
+        sec.top_margin = Cm(2.4)
+        sec.bottom_margin = Cm(2.8)
+        sec.left_margin = sec.right_margin = Cm(2.2)
 
 
-def make_docx(md_text: str, docx_path, images_search_root=None):
+def _field(paragraph, instruction, placeholder='请在 Word 中更新域'):
+    field = OxmlElement('w:fldSimple')
+    field.set(qn('w:instr'), instruction)
+    run = OxmlElement('w:r')
+    text = OxmlElement('w:t')
+    text.text = placeholder
+    run.append(text)
+    field.append(run)
+    paragraph._p.append(field)
+
+
+def _furniture(doc, layout):
+    from PIL import Image
+    mode = layout.get('header_mode', 'simple')
+    if mode == 'off':
+        return
+    for section in doc.sections:
+        section.header.is_linked_to_previous = False
+        section.footer.is_linked_to_previous = False
+        section.header_distance = section.footer_distance = Cm(.6)
+        for kind, container in [('header', section.header), ('footer', section.footer)]:
+            for old in list(container._element):
+                container._element.remove(old)
+            container.add_paragraph()
+            p = container.paragraphs[0]
+            p.clear()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.line_spacing = 1.0
+            picture = layout.get('furniture', {}).get(kind)
+            if picture and mode == 'original':
+                with Image.open(picture) as im:
+                    w, h = im.size
+                scale = min((section.page_width-section.left_margin-section.right_margin)/w, Cm(1.3)/h)
+                p.add_run().add_picture(picture, width=int(w*scale), height=int(h*scale))
+            elif kind == 'header':
+                set_font(p.add_run(layout.get('title', '译文')), size=8)
+            if kind == 'footer':
+                page = container.add_paragraph()
+                page.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                page.paragraph_format.space_before = page.paragraph_format.space_after = Pt(0)
+                _field(page, 'PAGE', '1')
+    update = OxmlElement('w:updateFields')
+    update.set(qn('w:val'), 'true')
+    doc.settings.element.append(update)
+
+
+def make_docx(md_text: str, docx_path, images_search_root=None, *, layout=None):
     doc = Document()
     _configure_document(doc)
     root = Path(images_search_root) if images_search_root else None
@@ -237,6 +332,9 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
                 warning = _add_image(doc, image[0], root)
                 if warning:
                     warnings.append(warning)
+                after_lines = [v.strip() for v in lines[i+1:] if v.strip()]
+                if not warning and after_lines and re.match(r'^(?:图|表|Figure|Table)\s*\d', after_lines[0], re.I):
+                    doc.paragraphs[-1].paragraph_format.keep_with_next = True
                 position = image.end()
             if s[position:].strip():
                 _paragraph(doc, s[position:].strip())
@@ -254,6 +352,17 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
                 reference_level = lv
             elif reference_level is not None and lv <= reference_level:
                 reference_level = None
+            if text.strip().lower() in {'目录', 'table of contents', 'contents'}:
+                end = i+1
+                while end < len(lines) and not re.match(r'^#{1,6}\s+', lines[end]):
+                    end += 1
+                entries = [x.strip() for x in lines[i+1:end] if x.strip() and not x.strip().isdigit()]
+                headings = {re.sub(r'^#{1,6}\s+', '', x).strip() for x in lines[end:] if re.match(r'^#{1,6}\s+', x)}
+                if entries and all(x in headings for x in entries):
+                    _field(doc.add_paragraph(), 'TOC \\o "1-3" \\h \\z \\u')
+                    i = end
+                    continue
+                _paragraph(doc, '以下目录如含页码，属于原文页码，不代表译文分页。', size=9, first_indent=False)
             i += 1
             continue
 
@@ -263,7 +372,12 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
             continue
 
         if re.match(r"^(图|表)\s*\d", s):
-            _paragraph(doc, s, size=9, first_indent=False, italic=True)
+            caption = _paragraph(doc, s, size=9, first_indent=False, italic=True)
+            following = next((x.strip() for x in lines[i+1:] if x.strip()), '')
+            previous = next((x.strip() for x in reversed(lines[:i]) if x.strip()), '')
+            if (following.startswith('![') or following.lower().startswith('<table')) and not previous.startswith('!['):
+                caption.paragraph_format.keep_with_next = True
+            caption.paragraph_format.keep_together = True
             i += 1
             continue
 
@@ -277,6 +391,8 @@ def make_docx(md_text: str, docx_path, images_search_root=None):
         _paragraph(doc, s)
         i += 1
 
+    _furniture(doc, layout or {'header_mode': 'simple'})
+    warnings.extend((layout or {}).get('warnings', []))
     doc.save(str(docx_path))
     print(f"Wrote {docx_path}")
     return warnings
