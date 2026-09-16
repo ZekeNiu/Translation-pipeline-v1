@@ -77,7 +77,11 @@ class App:
         self.cli_frame.grid(columnspan=3)
         self._field(self.cli_frame, "程序路径", "mineru_exe", mineru.get("executable", ""), 0)
         ttk.Button(self.cli_frame, text="检测环境", command=self._detect_mineru).grid(row=0, column=2, padx=8)
-        self._field(self.cli_frame, "解析后端", "mineru_backend", mineru.get("backend", "auto"), 1, ["auto", "pipeline"])
+        self._field(self.cli_frame, "解析后端", "mineru_backend", mineru.get("backend", "auto"), 1,
+                    ["auto", "hybrid-engine", "vlm-engine", "pipeline"])
+        ttk.Label(self.cli_frame, text="auto：使用安装版本的默认后端；3.4.5 默认 hybrid-engine。\n"
+                  "hybrid：混合解析；vlm：视觉语言模型；pipeline：传统解析。GPU 由本地环境决定。",
+                  wraplength=620).grid(row=2, column=0, columnspan=3, sticky="w")
         actions = ttk.Frame(page)
         actions.grid(row=6, sticky="ew", pady=12)
         self.run_btn = ttk.Button(actions, text="开始 / 继续任务", command=self._run)

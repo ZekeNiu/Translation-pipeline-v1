@@ -59,7 +59,7 @@ class MinerURunnerTests(unittest.TestCase):
             (root / "deep" / "full.md").write_text("full", encoding="utf-8")
             self.assertEqual(mineru_runner.locate_mineru_output_folder(root), root / "deep")
 
-    def test_local_cli_uses_pipeline_backend_when_requested(self):
+    def test_local_cli_forwards_explicit_backends_and_preserves_auto_default(self):
         calls = []
 
         def fake_run(cmd, *args, **kwargs):
@@ -80,10 +80,14 @@ class MinerURunnerTests(unittest.TestCase):
         ), patch("mineru_runner.parser_signature", return_value=({"engine": "test"}, True)):
             source = Path(td) / "paper.pdf"
             source.write_bytes(b"%PDF")
-            folder = mineru_runner.parse_with_local_cli(source, output_root=Path(td) / "out", backend="pipeline")
-            self.assertEqual((folder / "full.md").read_text(encoding="utf-8"), "# Parsed")
-            self.assertIn("-b", calls[0])
-            self.assertIn("pipeline", calls[0])
+            for backend in ("auto", "hybrid-engine", "vlm-engine", "pipeline"):
+                with self.subTest(backend=backend):
+                    folder = mineru_runner.parse_with_local_cli(source, output_root=Path(td) / "out", backend=backend)
+                    self.assertEqual((folder / "full.md").read_text(encoding="utf-8"), "# Parsed")
+                    if backend == "auto":
+                        self.assertNotIn("-b", calls[-1])
+                    else:
+                        self.assertEqual(calls[-1][calls[-1].index("-b") + 1], backend)
 
     def test_local_cli_missing_executable_has_clear_error(self):
         with tempfile.TemporaryDirectory() as td, patch("mineru_runner._resolve_executable", return_value=(None, "")):
