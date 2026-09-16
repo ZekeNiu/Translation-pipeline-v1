@@ -1,3 +1,4 @@
+from task_paths import artifact
 import json
 import re
 import tempfile
@@ -161,7 +162,7 @@ class PipelineQualityTests(unittest.TestCase):
             )
             sidecar = load_mineru_sidecar(root)
             cleaned, removed = strip_excluded_lines("Journal Header\n\nReal text\n927\n", sidecar)
-            self.assertEqual(removed, 2)
+            self.assertEqual(removed, 0)  # No coordinates: preserve potentially genuine content.
             self.assertIn("Real text", cleaned)
             self.assertEqual(sidecar.formula_texts, [r"\dot { V } O_2"])
 
@@ -357,12 +358,12 @@ class PipelineQualityTests(unittest.TestCase):
             result = md.read_text(encoding="utf-8")
             self.assertIn("# Right", result)
             self.assertNotIn("Wrong file", result)
-            self.assertNotIn("Journal Header", result)
+            self.assertIn("Journal Header", result)  # Labels alone are not deletion evidence.
             self.assertIn("1. Smith title during continuation line.", result)
-            self.assertTrue((out / "references_original.md").exists())
-            self.assertTrue((out / "references_normalized.md").exists())
-            self.assertIn("Reference normalization:", (out / "translation.log").read_text(encoding="utf-8"))
-            self.assertTrue((out / "mineru_structure_summary.json").exists())
+            self.assertTrue((artifact(out, 'references_original.md')).exists())
+            self.assertTrue((artifact(out, 'references_normalized.md')).exists())
+            self.assertIn("Reference normalization:", (artifact(out, 'translation.log')).read_text(encoding="utf-8"))
+            self.assertTrue((artifact(out, 'mineru_structure_summary.json')).exists())
 
 
 if __name__ == "__main__":

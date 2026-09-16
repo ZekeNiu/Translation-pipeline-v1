@@ -30,6 +30,7 @@ class MinerUSidecar:
     excluded_texts: set[str] = field(default_factory=set)
     formula_texts: list[str] = field(default_factory=list)
     provenance: list[dict] = field(default_factory=list)
+    furniture: list[dict] = field(default_factory=list)
 
     @property
     def has_data(self) -> bool:
@@ -102,7 +103,66 @@ def load_mineru_sidecar(folder: Path) -> MinerUSidecar:
         sidecar.source_files.append(path.name)
         _walk(data, sidecar)
     sidecar.provenance = load_provenance(folder)
+    sidecar.furniture = load_furniture(folder)
+    if sidecar.furniture:
+        repeated = Counter(normalize_line(r['text']) for r in sidecar.furniture if r['margin'])
+        body_texts = {normalize_line(r['text']) for r in sidecar.provenance}
+        sidecar.excluded_texts = {normalize_line(r['text']) for r in sidecar.furniture
+                                 if r['margin'] and r['text'] and normalize_line(r['text']) not in body_texts
+                                 and (repeated[normalize_line(r['text'])] >= 2 or r['type'] == 'page_number')}
+    else:
+        sidecar.excluded_texts.clear()  # Labels without reliable positions are not deletion evidence.
     return sidecar
+
+
+def load_furniture(folder):
+    """The v1 content list has documented normalized 0..1000 bounding boxes."""
+    for path in sorted(Path(folder).glob('*_content_list.json')):
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, list):
+            continue
+        records = []
+        for index, node in enumerate(data):
+            if not isinstance(node, dict) or node.get('type') not in HEADER_FOOTER_TYPES:
+                continue
+            bbox, page = node.get('bbox'), node.get('page_idx')
+            if not isinstance(page, int) or not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            if not all(isinstance(v, (int, float)) for v in bbox) or not (0 <= bbox[0] <= bbox[2] <= 1000 and 0 <= bbox[1] <= bbox[3] <= 1000):
+                continue
+            records.append({'text': str(node.get('text', '')), 'type': node['type'], 'page': page + 1,
+                            'bbox': bbox, 'index': index, 'margin': bbox[3] <= 100 or bbox[1] >= 900})
+        if records:
+            return records
+    return []
+
+
+def find_omissions(sidecar, markdown, units):
+    """Never silently restore text. Persist only source-grounded candidates."""
+    from task_state import fingerprint
+    result, seen = [], set()
+    content = location_key(markdown)
+    headings = re.compile(r'^(?:INTRODUCTION|METHODS|RESULTS|DISCUSSION|CONCLUSION|CONTRIBUTORS)\b', re.I)
+    for record in sidecar.furniture:
+        text = record['text'].strip()
+        key = location_key(text)
+        if (record['margin'] and not headings.match(text)) or len(text) < 8 or key in content or key in seen:
+            continue
+        if not (len(text.split()) >= 3 or text.isupper()):
+            continue
+        seen.add(key)
+        # Only insert before an existing later block on the same original page.
+        following = [u for u in units if u.get('page') == record['page'] and u.get('bbox')
+                     and u['bbox'][1] >= record['bbox'][3] and u.get('kind') != 'cell']
+        following.sort(key=lambda u: (u['bbox'][1], u['bbox'][0]))
+        result.append({'id': 'omission_' + fingerprint(record['page'], record['bbox'], text)[:16],
+                       'source': text, 'page': record['page'], 'bbox': record['bbox'],
+                       'insert_before': following[0]['id'] if following else None,
+                       'reason': '解析疑似遗漏：正文区域内容被标为页眉页脚，未进入解析正文。'})
+    return result
 
 
 def location_key(text):
