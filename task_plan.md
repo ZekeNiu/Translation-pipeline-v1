@@ -59,6 +59,6 @@ Defaults: global/book independently off, book overrides global, manual/imported 
 - [done] Unified located HTML/Markdown quality issues and confirmed-retention review workflow.
 - [done] Conservative page furniture filtering, omission detection and explicit selected recovery.
 - [done] A4 semantic pagination, wide tables, original furniture with new page fields, preview/settings.
-- [ ] Windows 3.11/3.14 regression, actual-document no-model reexport and Word/PDF visual inspection; staged GitHub release.
+- [done] Windows 3.11/3.14 regression, actual-document no-model reexport and Word/PDF visual inspection; staged GitHub release.
 
 Defaults: preserve original furniture style where safe; comfortable Chinese reflow; AI suggestions/recovery only on explicit selection. Do not retranslate existing task automatically.

@@ -54,3 +54,5 @@ PDF 渲染使用 pypdfium2 与 Pillow，DOCX 使用 python-docx；不依赖 Mine
 3. 不让旧版代码直接写入新版目录；旧快照不包含升级后的人工修改。
 
 可以通过新建 `git revert` 提交回退代码，或在独立工作目录检出旧版本。不要强制推送或删除用户数据；从任务快照恢复不需要重新解析 PDF。
+
+最终功能提交 `ddfffd5` 已通过 GitHub Windows Python 3.11/3.14 自动检查：[运行记录](https://github.com/ZekeNiu/Translation-pipeline-v1/actions/runs/35050203134)。发布标签为 `release/output-review-layout-20260916`；发布文档提交不改变功能代码。

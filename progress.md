@@ -74,3 +74,5 @@
 
 - Final concurrency audit: settings change and reexport now share one lock; prior layout settings enter history first. Added GUI source/translation/ID search. Preparation upgrades reuse only exact hash-validated original segment snapshots; real task copy resumed all 8 segments with zero model calls.
 - Updated complete suite: 133 tests pass locally on Windows Python 3.11 (27.119s) and 3.14 (23.215s). GitHub passed f25d9dc on both versions before the final preparation regression addition.
+
+- Final feature ddfffd5 passed GitHub Windows 3.11/3.14 (133 tests each), run 35050203134. All implementation and local/remote acceptance complete. Publishing documentation-only audit with release/output-review-layout-20260916; baseline rollback remains d4a5801.
