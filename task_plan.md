@@ -65,9 +65,9 @@ Defaults: preserve original furniture style where safe; comfortable Chinese refl
 
 ## Long-book usability (approved 2026-09-16)
 Baseline: 6f32e3a. Preserve user data, original interfaces, opt-in model calls and staged GitHub rollback.
-1. [in progress] Baseline tag and branch; revision/export transaction and durable issue state.
-2. [pending] Issue-first review, grouped tables, chapter reading, task library and independent save/export.
-3. [pending] Resumable local/custom API long-PDF parsing, safe boundaries and shared local service.
-4. [pending] Bounded semantic context and context-aware table caches; stable content identities.
-5. [pending] Performance/storage/usage, migration, Windows regression, live and visual acceptance; staged push and main release.
+1. [done] Baseline tag and branch; revision/export transaction and durable issue state (47078c1).
+2. [done] Issue-first review, grouped tables, chapter reading, task library and independent save/export; actual report and 10k-unit GUI validated.
+3. [done] Resumable local/custom API long-PDF parsing, safe boundaries and shared local service; GPU/local async API live checks passed.
+4. [done] Bounded semantic context and context-aware table caches; stable content identities; four synthetic paid requests verified usage.
+5. [in progress] 152 tests passed locally on Windows 3.11/3.14; actual report no-model reexport and 28-page native Word/PDF verification done. Final publication checks/documentation pending.
 Acceptance: 10k-unit UI search/switch <=500 ms and single-edit save target <=1s; 1k-page synthetic planning; no model requests for navigation/confirmation/export; retain existing manual revisions and previous valid artifacts.

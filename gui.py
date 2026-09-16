@@ -32,6 +32,7 @@ class App:
         except SettingsError as exc:
             self.settings, self.save_blocked, load_error = {}, True, str(exc)
         self.providers = self.settings.get("providers", {})
+        self.long_doc_options = self.settings.get('long_doc_options', {})
         self.current_provider = ""
         self.events, self.cancel_event = queue.Queue(), threading.Event()
         self.running = self.closing = self.auxiliary_busy = False
@@ -39,12 +40,16 @@ class App:
         self.save_timer = None
         self.active_secrets, self.stage = [], ""
         self.result_dir = self.settings.get("result_dir", "")
+        from task_library import TaskLibrary
+        self.library = TaskLibrary(self.store.path.parent / 'tasks.json')
+        if self.result_dir:
+            self.library.register(self.result_dir)
         self.vars = {}
         self.page = page = ttk.Frame(root, padding=18)
         page.pack(fill="both", expand=True)
         page.columnconfigure(0, weight=1)
         ttk.Label(page, text="学术文档翻译", font=("Microsoft YaHei UI", 17, "bold")).grid(row=0, sticky="w")
-        ttk.Label(page, text="选择材料，确认服务；中断后可继续已保存的任务。").grid(row=1, sticky="w", pady=(4, 14))
+        ttk.Label(page, text="选择文档 → 翻译 → 阅读成品 → 重点复核；中断后可继续。").grid(row=1, sticky="w", pady=(4, 14))
         source = self._frame(page, "翻译材料", 2)
         self._field(source, "输入方式", "source_mode", SOURCE_EXISTING_FOLDER, 0,
                     [SOURCE_EXISTING_FOLDER, SOURCE_API, SOURCE_LOCAL_CLI]).bind("<<ComboboxSelected>>", lambda e: self._update_source_mode())
@@ -56,6 +61,7 @@ class App:
         self._field(self.api_frame, "MinerU URL", "mineru_url", mineru.get("url", os.environ.get("MINERU_API_BASE_URL", "https://mineru.net")), 0)
         self._field(self.api_frame, "MinerU Key", "mineru_key", mineru.get("api_key", os.environ.get("MINERU_API_KEY", "")), 1, secret=True)
         service = self._frame(page, "翻译服务", 3)
+        self.service_frame = service
         self._field(service, "厂商", "provider", os.environ.get("AI_PROVIDER", "deepseek"), 0, list(PROVIDER_PRESETS)).bind("<<ComboboxSelected>>", lambda e: self._apply_provider_defaults())
         self.model_box = self._field(service, "模型", "model", "", 1, [], editable=True)
         self.refresh_btn = ttk.Button(service, text="刷新模型", command=self._refresh_models)
@@ -65,12 +71,16 @@ class App:
         toggles = ttk.Frame(page)
         toggles.grid(row=4, sticky="ew", pady=4)
         self.advanced_var, self.logs_var = tk.BooleanVar(), tk.BooleanVar()
+        self.service_var = tk.BooleanVar(value=not bool(self.providers))
+        ttk.Checkbutton(toggles, text='翻译服务', variable=self.service_var, command=self._toggle_panels).pack(side='left')
         ttk.Checkbutton(toggles, text="高级设置", variable=self.advanced_var, command=self._toggle_panels).pack(side="left")
         ttk.Checkbutton(toggles, text="详细日志", variable=self.logs_var, command=self._toggle_panels).pack(side="left", padx=14)
         ttk.Button(toggles, text="专业术语表", command=self._open_glossary).pack(side="left", padx=8)
+        ttk.Button(toggles, text='我的任务', command=self._open_library).pack(side='left', padx=8)
         self.save_label = ttk.Label(toggles, text="设置自动保存到当前账户")
         self.save_label.pack(side="right")
         self.advanced_frame = self._frame(page, "高级设置", 5)
+        ttk.Button(self.advanced_frame, text='长文与上下文设置', command=self._long_doc_settings).grid(row=0, column=2, padx=8)
         self._field(self.advanced_frame, "并发模式", "speed_mode", "balanced", 0, ["safe", "balanced", "fast"])
         self._field(self.advanced_frame, "译文目录（可选）", "output_dir", "", 1)
         self._field(self.advanced_frame, "解析文件目录", "mineru_output", mineru.get("output", str(DEFAULT_MINERU_OUTPUT_ROOT)), 2)
@@ -92,7 +102,7 @@ class App:
         self.stop_btn.pack(side="left", padx=10)
         self.open_btn = ttk.Button(actions, text="打开结果", command=self._open_result, state="normal" if self.result_dir else "disabled")
         self.open_btn.pack(side="right")
-        ttk.Button(actions, text="复核译文", command=self._open_review).pack(side="right", padx=8)
+        ttk.Button(actions, text="重点复核", command=self._open_review).pack(side="right", padx=8)
         self.progress_label = ttk.Label(page, text=load_error or "就绪", wraplength=750)
         self.progress_label.grid(row=7, sticky="w")
         self.progress = ttk.Progressbar(page)
@@ -166,6 +176,7 @@ class App:
         # Never persist top-level plaintext fields from the worker snapshot.
         self.settings = {k: values[k] for k in ("provider", "source_mode", "input_path", "speed_mode", "output_dir", "header_mode")}
         self.settings.update(providers=self.providers, result_dir=self.result_dir,
+                             long_doc_options={k: v for k, v in self.long_doc_options.items() if k != 'retry_unknown'},
                              mineru={"url": values["mineru_url"], "api_key": values["mineru_key"], "output": values["mineru_output"],
                                      "executable": values["mineru_exe"], "backend": values["mineru_backend"]})
         try:
@@ -185,6 +196,7 @@ class App:
             self._toggle_panels()
 
     def _toggle_panels(self):
+        self.service_frame.grid() if self.service_var.get() else self.service_frame.grid_remove()
         self.advanced_frame.grid() if self.advanced_var.get() else self.advanced_frame.grid_remove()
         self.log.grid() if self.logs_var.get() else self.log.grid_remove()
         self.root.update_idletasks()
@@ -231,7 +243,9 @@ class App:
             return opts["input_path"]
         emit = lambda info: progress_cb(info if isinstance(info, dict) else {"msg": info, "stage": "parse"})
         common = {"output_root": opts["mineru_output"] or None, "progress": emit, "cancel_event": self.cancel_event}
+        common['parse_options'] = opts.get('parse_options', {})
         if opts["source_mode"] == SOURCE_LOCAL_CLI:
+            common['parse_options'] = {k: v for k, v in common['parse_options'].items() if k not in {'max_bytes', 'service_max_pages', 'retry_unknown'}}
             return str(parse_with_local_cli(opts["input_path"], executable=opts["mineru_exe"] or None, backend=opts["mineru_backend"], **common))
         folder = parse_with_api(opts["input_path"], base_url=opts["mineru_url"], api_key=opts["mineru_key"] or None, **common)
         from task_state import write_json, file_hash
@@ -244,6 +258,9 @@ class App:
         if self.running or self.auxiliary_busy:
             return
         opts = self._snapshot()
+        opts['parse_options'] = {k: v for k, v in self.long_doc_options.items() if k != 'context_budget'}
+        opts['context_budget'] = self.long_doc_options.get('context_budget')
+        self.long_doc_options.pop('retry_unknown', None)
         path = Path(opts["input_path"])
         error = ""
         if not opts["input_path"] or not path.exists():
@@ -276,6 +293,7 @@ class App:
         self.progress.configure(value=0)
         self.progress_label.configure(text="正在检查任务…")
         self.stage = ""
+        self.intake = self.library.start_intake(opts) if opts['source_mode'] != SOURCE_EXISTING_FOLDER else None
         def task():
             try:
                 from translate import run
@@ -286,7 +304,7 @@ class App:
                 check_cancel(self.cancel_event)
                 md, _docx = run(folder, opts["output_dir"] or None, **{k: opts[k] for k in ("provider", "base_url", "api_key", "model", "speed_mode")},
                                 progress_callback=progress_cb, cancel_event=self.cancel_event, parse_seconds=elapsed, glossary=glossary, source_info=source_info,
-                                export_options={'header_mode': {'保留原样式': 'original', '简洁样式': 'simple', '关闭': 'off'}[opts['header_mode']]})
+                                export_options={'header_mode': {'保留原样式': 'original', '简洁样式': 'simple', '关闭': 'off'}[opts['header_mode']]}, context_budget=opts['context_budget'])
                 summary = read_json(artifact(Path(md).parent, 'quality_report.json'), {})
                 self.events.put(("done", (str(Path(md).parent), summary.get("status", "completed"))))
             except TaskCancelled as exc:
@@ -319,8 +337,14 @@ class App:
                     self._log(value.get("msg", ""))
                 if value.get("output_dir"):
                     self.result_dir = value["output_dir"]
+                    self.library.register(self.result_dir)
+                    if getattr(self, 'intake', None):
+                        self.library.finish_intake(self.intake, self.result_dir, 'completed')
+                        self.intake = None
                     self.open_btn.configure(state="normal" if value.get("artifact_ready", True) else "disabled")
             elif event in {"done", "stopped", "failed"}:
+                if getattr(self, 'intake', None):
+                    self.library.finish_intake(self.intake, status='stopped' if event == 'stopped' else 'partial_failed')
                 self.running = False
                 self.run_btn.configure(state="normal")
                 self.stop_btn.configure(state="disabled")
@@ -424,6 +448,133 @@ class App:
     def _open_result(self):
         if self.result_dir and Path(self.result_dir).is_dir():
             os.startfile(self.result_dir)
+
+    def _open_library(self):
+        window = tk.Toplevel(self.root)
+        window.title('我的翻译任务')
+        window.geometry('1050x500')
+        tree = ttk.Treeview(window, columns=('title', 'status', 'issues', 'export', 'updated'), show='headings')
+        for key, title, width in [('title', '书名 / 文档', 360), ('status', '执行状态', 110), ('issues', '成品报告疑点', 110), ('export', '成品状态', 120), ('updated', '上次操作', 160)]:
+            tree.heading(key, text=title)
+            tree.column(key, width=width)
+        tree.pack(fill='both', expand=True, padx=12, pady=12)
+        names = {'completed': '已完成', 'needs_review': '翻译完成', 'partial_failed': '部分失败', 'running': '执行中 / 待续跑', 'stopped': '已停止', 'missing': '目录待关联'}
+        def refresh():
+            tree.delete(*tree.get_children())
+            for row in self.library.rows():
+                tree.insert('', 'end', iid=row['path'], values=(row['title'], names.get(row['status'], row['status']), row['issues'], '有修订待更新' if row['pending'] else '已生成', row['updated']))
+        def selected():
+            if not tree.selection():
+                raise ValueError('请先选择一个任务。')
+            return Path(tree.selection()[0])
+        def action(kind):
+            try:
+                if self.running or self.auxiliary_busy:
+                    raise ValueError('请等待当前任务结束后切换任务。')
+                out = selected()
+                if not out.is_dir():
+                    raise ValueError('目录已移动，请使用“导入 / 重新关联”选择新位置。')
+                if self.review_window and self.review_window.window.winfo_exists():
+                    self.review_window.close()
+                    if self.review_window.window.winfo_exists():
+                        return
+                self.result_dir = str(out)
+                if kind == 'review':
+                    self._open_review()
+                elif kind == 'read':
+                    target = out / 'translated.docx'
+                    os.startfile(str(target if target.is_file() else out))
+                elif kind == 'resume':
+                    document = read_json(artifact(out, 'review_document.json'), {})
+                    state = read_json(artifact(out, 'task_state.json'), {})
+                    if state.get('phase') == 'parse':
+                        values = state['options']
+                        self.long_doc_options = dict(values.get('parse_options', {}))
+                        if values.get('context_budget'):
+                            self.long_doc_options['context_budget'] = values['context_budget']
+                        self.vars['provider'].set(values['provider'])
+                        self._apply_provider_defaults()
+                        for key, value in values.items():
+                            if key in self.vars:
+                                self.vars[key].set(value)
+                        self._update_source_mode()
+                        self._run()
+                        return
+                    source = Path(state.get('source', ''))
+                    if not source.is_file():
+                        folder = filedialog.askdirectory(title='重新关联原 MinerU 解析目录', parent=window)
+                        if not folder:
+                            return
+                        source = Path(folder) / 'full.md'
+                    config = document.get('config', {})
+                    self.vars['provider'].set(config.get('provider', state.get('provider', 'custom')))
+                    self._apply_provider_defaults()
+                    for key in ('model', 'base_url'):
+                        if key in config:
+                            self.vars[key].set(config[key])
+                    self.vars['input_path'].set(str(source.parent))
+                    self.vars['output_dir'].set(str(out))
+                    self.vars['source_mode'].set(SOURCE_EXISTING_FOLDER)
+                    self._update_source_mode()
+                    self._run()
+                elif kind == 'storage':
+                    from task_library import storage_inventory, usage_summary, clean_temporary
+                    sizes = storage_inventory(out)
+                    text = '\n'.join(f'{k}：{v / 1024 / 1024:.1f} MB' for k, v in sizes.items()) + '\n\n' + usage_summary(out)
+                    if messagebox.askyesno('空间与用量', text + '\n\n仅清理临时导出和未采用候选缓存？原页摘录、人工修订及其他数据保留。', parent=window):
+                        clean_temporary(out)
+                self._save_settings()
+            except Exception as exc:
+                messagebox.showerror('任务操作未完成', str(exc), parent=window)
+        def add():
+            folder = filedialog.askdirectory(title='选择已有翻译任务目录', parent=window)
+            if folder:
+                if not artifact(Path(folder), 'task_state.json').is_file():
+                    messagebox.showerror('不能导入', '所选目录没有任务记录。', parent=window)
+                    return
+                self.library.register(folder)
+                refresh()
+        bar = ttk.Frame(window, padding=12)
+        bar.pack(fill='x')
+        for label, kind in [('阅读成品', 'read'), ('重点复核', 'review'), ('继续失败任务', 'resume'), ('空间与用量', 'storage')]:
+            ttk.Button(bar, text=label, command=lambda k=kind: action(k)).pack(side='left', padx=4)
+        ttk.Button(bar, text='导入 / 重新关联', command=add).pack(side='left', padx=4)
+        ttk.Button(bar, text='刷新', command=refresh).pack(side='left', padx=4)
+        refresh()
+
+    def _long_doc_settings(self):
+        window = tk.Toplevel(self.root)
+        window.title('长文与上下文设置')
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, text='本地 / 自建 API 的分片参数；官网仍遵守 200 页 / 190MB 上限。\n上下文预算用于新任务；旧任务保留已验证的上下文与缓存。').grid(row=0, columnspan=2, pady=8)
+        fields = {}
+        for row, (key, label, default) in enumerate([
+            ('threshold_pages', '超过多少页启用外部分片', 256), ('target_pages', '目标分片页数', 128),
+            ('min_pages', '章节边界搜索下限', 64), ('max_pages', '每片页数上限', 192),
+            ('service_max_pages', '自建服务单文件页数上限（空白未知）', ''),
+            ('max_bytes', '自建服务文件上限（字节；空白不限）', ''),
+            ('context_budget', '保守上下文预算（含输出预留）', 32768)], 1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', pady=4)
+            fields[key] = tk.StringVar(value=str(self.long_doc_options.get(key, default)))
+            ttk.Entry(frame, textvariable=fields[key]).grid(row=row, column=1, padx=8)
+        retry = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text='已在服务端核实：仅下一次允许重交结果未知的任务', variable=retry).grid(row=8, columnspan=2, pady=10)
+        def save():
+            try:
+                values = {k: int(v.get()) for k, v in fields.items() if v.get().strip()}
+                if not 1 <= values['min_pages'] <= values['target_pages'] <= values['max_pages'] or values['threshold_pages'] < 1 or values['context_budget'] < 4096 or values.get('max_bytes', 1) < 1:
+                    raise ValueError('请检查页数顺序、体积与上下文预算。')
+                if self.running or self.auxiliary_busy:
+                    raise ValueError('任务运行中不能修改这些设置。')
+                self.long_doc_options = values
+                self._save_settings()
+                if retry.get():
+                    self.long_doc_options['retry_unknown'] = True
+                window.destroy()
+            except ValueError as exc:
+                messagebox.showerror('设置未保存', str(exc), parent=window)
+        ttk.Button(frame, text='保存设置', command=save).grid(row=9, columnspan=2)
 
     def _close(self):
         self._save_settings()

@@ -32,6 +32,8 @@ class ReviewGuiTests(unittest.TestCase):
         window = ReviewWindow(self.root, self.path, lambda _: None, readonly=lambda: locked)
         try:
             self.root.update()
+            window.filter.set(False)
+            window.refresh_list()
             window.tree.selection_set('s:b0')
             window.select()
             self.assertIn('力为', window.target.get('1.0', 'end'))
