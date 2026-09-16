@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -138,6 +139,9 @@ def parse_with_local_cli(
     timeout: int | None = None,
     progress=None,
     cancel_event=None,
+    parse_options=None,
+    _api_url=None,
+    _prepared=None,
 ) -> Path:
     check_cancel(cancel_event)
     source = Path(input_path)
@@ -150,6 +154,19 @@ def parse_with_local_cli(
     if not exe_path:
         raise MinerURunnerError("MinerU CLI was not found. Install MinerU or set the executable path.")
 
+    from parse_jobs import needs_parts, managed_parse, local_service
+    if not _prepared and source.is_file() and needs_parts(source, parse_options):
+        env = _cli_environment(exe_path)
+        signature, reusable = parser_signature(exe_path, backend, env, detect_mineru_cli)
+        # Unverifiable environments cannot silently reuse a previous partition run.
+        identity = signature if reusable else {**signature, 'attempt': uuid.uuid4().hex}
+        shared = bool(re.search(r'\b3\.4\.5\b', str(signature.get('engine', ''))))
+        return managed_parse(source, output_root or DEFAULT_MINERU_OUTPUT_ROOT, identity,
+            lambda part, root, url: parse_with_local_cli(part, root, exe_path, backend, timeout, progress, cancel_event,
+                _api_url=url, _prepared=(env, signature, reusable)),
+            strategy=parse_options, progress=progress, cancel_event=cancel_event,
+            service=(lambda directory: local_service(exe_path, env, directory, progress=progress, cancel_event=cancel_event)) if shared else None)
+
     root = (Path(output_root) if output_root else DEFAULT_MINERU_OUTPUT_ROOT).resolve()
     source_hash = file_hash(source) if source.is_file() else fingerprint([
         (p.relative_to(source).as_posix(), file_hash(p)) for p in sorted(source.rglob("*")) if p.is_file()])
@@ -159,8 +176,10 @@ def parse_with_local_cli(
         check_cancel(cancel_event)
         if progress:
             progress({"msg": f"检查 MinerU 版本与本地模型：{exe_path}", "stage": "parse"})
-        env = _cli_environment(exe_path)
-        signature, reusable = parser_signature(exe_path, backend, env, detect_mineru_cli)
+        env, signature, reusable = _prepared or (None, None, None)
+        if env is None:
+            env = _cli_environment(exe_path)
+            signature, reusable = parser_signature(exe_path, backend, env, detect_mineru_cli)
         cache = read_json(out_dir / "local_state.json", {})
         if reusable and cache.get("signature") == signature and result_valid(cache):
             if progress:
@@ -173,6 +192,8 @@ def parse_with_local_cli(
         result_dir = attempt / "result"
         result_dir.mkdir(parents=True)
         cmd = [exe_path, "-p", str(source.resolve()), "-o", str(result_dir.resolve())]
+        if _api_url:
+            cmd.extend(['--api-url', _api_url])
         if not Path(exe_path).name.lower().startswith("magic-pdf") and backend and backend != "auto":
             cmd.extend(["-b", backend])
         try:
@@ -320,6 +341,7 @@ def parse_with_api(
     max_wait: int = 1800,
     progress=None,
     cancel_event=None,
+    parse_options=None,
 ) -> Path:
     check_cancel(cancel_event)
     source = Path(input_path)
@@ -333,60 +355,7 @@ def parse_with_api(
                               timeout=timeout, poll_interval=poll_interval, max_wait=max_wait,
                               progress=progress, cancel_event=cancel_event)
 
-    import requests
-
-    out_dir = _timestamped_output_dir(source, Path(output_root) if output_root else None)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    session = requests.Session()
-    base = base_url.strip().rstrip("/")
-    modes = ["file_parse", "tasks"] if mode == "auto" else [mode]
-    last_error: Exception | None = None
-
-    for selected in modes:
-        try:
-            with source.open("rb") as fh:
-                files = {"file": (source.name, fh, "application/octet-stream")}
-                if selected == "tasks":
-                    endpoint = f"{base}/tasks"
-                else:
-                    endpoint = f"{base}/file_parse"
-                if progress:
-                    progress(f"☁️ MinerU API submit: {selected}")
-                resp = session.post(endpoint, headers=_auth_headers(api_key), files=files, timeout=timeout)
-            if mode == "auto" and resp.status_code in {404, 405}:
-                last_error = MinerURunnerError(f"{selected} endpoint returned {resp.status_code}")
-                continue
-            resp.raise_for_status()
-
-            if selected != "tasks":
-                _handle_api_response(resp, out_dir, session, base, api_key)
-                return locate_mineru_output_folder(out_dir)
-
-            data = resp.json()
-            task_id = _task_id_from_json(data)
-            if not task_id:
-                _handle_api_response(resp, out_dir, session, base, api_key)
-                return locate_mineru_output_folder(out_dir)
-
-            deadline = time.time() + max_wait
-            while time.time() < deadline:
-                check_cancel(cancel_event)
-                status_resp = session.get(f"{base}/tasks/{task_id}", headers=_auth_headers(api_key), timeout=timeout)
-                status_resp.raise_for_status()
-                status_data = status_resp.json()
-                status = _task_status_from_json(status_data)
-                if progress:
-                    progress(f"☁️ MinerU API task {task_id}: {status or 'polling'}")
-                if status in {"success", "succeeded", "done", "completed", "finished"}:
-                    _handle_api_response(status_resp, out_dir, session, base, api_key)
-                    return locate_mineru_output_folder(out_dir)
-                if status in {"failed", "error", "cancelled", "canceled"}:
-                    raise MinerURunnerError(f"MinerU API task failed: {json.dumps(status_data, ensure_ascii=False)[:600]}")
-                time.sleep(poll_interval)
-            raise MinerURunnerError(f"MinerU API task timed out after {max_wait} seconds.")
-        except TaskCancelled:
-            raise
-        except Exception as exc:
-            last_error = exc
-            break  # Only an explicit 404/405 above is evidence for another protocol.
-    raise MinerURunnerError(f"MinerU API parse failed: {last_error}")
+    from custom_parser import parse_custom
+    return parse_custom(source, base_url, api_key, output_root or DEFAULT_MINERU_OUTPUT_ROOT,
+        mode=mode, timeout=timeout, poll_interval=poll_interval, max_wait=max_wait,
+        progress=progress, cancel_event=cancel_event, parse_options=parse_options)

@@ -9,7 +9,7 @@ from task_state import check_cancel, file_hash
 
 MAX_PAGES = 200
 MAX_BYTES = 190_000_000
-PDF_PLAN_VERSION = 1
+PDF_PLAN_VERSION = 2
 
 
 @dataclass
@@ -91,7 +91,8 @@ def _choose_boundary(reader, start, ceiling, outlines, text_cache):
     return page, candidates[page][1]
 
 
-def prepare_parts(source: Path, directory: Path, *, max_pages=MAX_PAGES, max_bytes=MAX_BYTES, cancel_event=None):
+def prepare_parts(source: Path, directory: Path, *, max_pages=MAX_PAGES, max_bytes=MAX_BYTES, cancel_event=None,
+                  target_pages=None, min_pages=1):
     source, directory = Path(source).resolve(), Path(directory)
     if not source.is_file():
         raise ValueError("请选择存在的文档文件。")
@@ -127,7 +128,15 @@ def prepare_parts(source: Path, directory: Path, *, max_pages=MAX_PAGES, max_byt
     while start < count:
         check_cancel(cancel_event)
         ceiling = min(start + max_pages, count)
-        end, reason = _choose_boundary(reader, start, ceiling, outlines, text_cache)
+        if target_pages and ceiling < count:
+            choices = {p: hint for p, hint in outlines.items() if start + min_pages <= p <= ceiling}
+            if choices:
+                end = min(choices, key=lambda p: (-choices[p][0], abs(p - start - target_pages)))
+                reason = choices[end][1]
+            else:
+                end, reason = _choose_boundary(reader, start, min(start + target_pages, count), {}, text_cache)
+        else:
+            end, reason = _choose_boundary(reader, start, ceiling, outlines, text_cache)
         target = directory / f"part_{len(parts) + 1:04d}.pdf"
         while True:
             check_cancel(cancel_event)
@@ -143,8 +152,7 @@ def prepare_parts(source: Path, directory: Path, *, max_pages=MAX_PAGES, max_byt
         start = end
     main_parts = list(parts)
     for left, right in zip(main_parts, main_parts[1:]):
-        if left.reason in {"chapter", "section"}:
-            continue
+        # A heading is only a hint: tables/footnotes can still cross that edge.
         boundary = left.end
         start, end = max(left.start, boundary - 2), min(right.end, boundary + 2)
         target = directory / f"seam_{boundary:06d}.pdf"

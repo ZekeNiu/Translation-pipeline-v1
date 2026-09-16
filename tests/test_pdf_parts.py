@@ -32,7 +32,7 @@ class PdfPartsTests(unittest.TestCase):
             parts, _, _ = prepare_parts(source, Path(td) / 'parts')
             self.assertEqual(parts[0].end, 110)
             self.assertEqual(parts[0].reason, 'chapter')
-            self.assertTrue(all(p.kind == 'main' for p in parts))
+            self.assertTrue(any(p.kind == 'seam' for p in parts))
 
     def test_scanned_unknown_edges_get_seam_windows(self):
         with tempfile.TemporaryDirectory() as td:
