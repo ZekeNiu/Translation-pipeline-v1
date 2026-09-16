@@ -98,7 +98,8 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
     def progress(message, **info):
         if progress_callback:
             progress_callback({"msg": redact(message, [config.api_key]), **info})
-    with translation_lock(out):
+    from task_state import task_lock
+    with task_lock(artifact(out, '_export_lock')), translation_lock(out):
         if export_options is not None:
             write_json(artifact(out, 'export_options.json'), {'version': 1, **export_options})
         state_path = artifact(out, 'task_state.json')
@@ -116,7 +117,10 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
                 for name in ("translated.md", "translated.docx", "quality_report.json", "quality_report.md", "task_state.json", "review_document.json", "review_edits.json", "glossary_snapshot.json", "source_document.json"):
                     if artifact(out, name).is_file():
                         shutil.copy2(artifact(out, name), previous / name)
-            state = {"version": 3, "identity": identity, "source_hash": document_hash, "config_hash": config_hash, "segments": {}}
+            state = {"version": 3, "identity": identity, "source_hash": document_hash, "config_hash": config_hash, "segments": {}, 'context_version': 2}
+        config = replace(config, use_context=state.get('context_version') == 2,
+                         context_budget=config.context_budget or state.get('context_budget'))
+        state['context_budget'] = config.context_budget
         state['review_version'] = 1
         if state.get("checks_version") != 2:
             # Revalidate raw cached responses when rules change; no need to retranslate them.
@@ -146,7 +150,14 @@ def run_job(engine, config, input_folder, output_dir=None, *, progress_callback=
 def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, state_path,
              progress, speed_mode, max_workers, cancel_event, parse_seconds):
     metrics = []
-    config = replace(config, cancel_event=cancel_event, metrics=metrics)
+    ledger = artifact(out, 'translation_usage.jsonl')
+    if not ledger.exists():
+        from usage_records import append_usage
+        for record in read_json(artifact(out, 'quality_report.json'), {}).get('requests', []):
+            append_usage(ledger, {**record, 'imported_legacy': True})
+        if not ledger.exists():
+            ledger.touch()
+    config = replace(config, cancel_event=cancel_event, metrics=metrics, usage_path=ledger)
     cache_dir = artifact(out, '_cache')
     cache_dir.mkdir(exist_ok=True)
     references_original, references_normalized, reference_reports, prepared = [], [], [], []
@@ -167,7 +178,9 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
             artifact(out, name).unlink(missing_ok=True)
     if sidecar.has_data:
         write_sidecar_summary(sidecar, artifact(out, 'mineru_structure_summary.json'))
-    segments = engine.split_body_into_segments("\n\n".join(prepared))
+    from translation_context import budget_for, neighbor, chapter_paths, stable_content_ids
+    chunk_limit = min(10000, budget_for(config) // 8) if config.use_context else 10000
+    segments = engine.split_body_into_segments("\n\n".join(prepared), max_chunk=chunk_limit, min_chunk=min(1800, chunk_limit))
     # A cleanup-rule upgrade must not repartition an existing book, discard edits,
     # or silently request the whole translation again. Reuse only exact, hashed
     # original segment snapshots belonging to this unchanged source/config.
@@ -186,6 +199,11 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         chapters.append(headings[0] if headings else chapter)
         if headings:
             chapter = headings[-1]
+    if config.use_context:
+        chapters = chapter_paths(segments)
+    context_limit = min(1800, budget_for(config) // 24) if config.use_context else 300
+    previous_contexts = [(neighbor(segments[i - 1], tail=True, limit=context_limit) if config.use_context else excerpts[i - 1][-300:]) if i else '' for i in range(len(segments))]
+    following_contexts = [(neighbor(segments[i + 1], limit=context_limit) if config.use_context else excerpts[i + 1][:300]) if i + 1 < len(segments) else '' for i in range(len(segments))]
     guide = engine.build_consistency_guide(raw)
     workers = max_workers or engine._env_int("AI_MAX_WORKERS", 0) or {"safe": 1, "balanced": 2, "fast": 4}.get(speed_mode or os.environ.get("AI_SPEED_MODE", "balanced"), 2)
     workers = max(1, min(4, int(workers)))
@@ -197,7 +215,7 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         if record.get("glossary_terms", []) != effective_terms:
             record["status"] = "pending"
         record["glossary_terms"] = effective_terms
-        record.update(source_hash=fingerprint(segments[i]), index=i, context_hash=fingerprint(chapters[i], excerpts[i - 1][-300:] if i else "", excerpts[i + 1][:300] if i + 1 < len(ids) else ""))
+        record.update(source_hash=fingerprint(segments[i]), index=i, context_hash=fingerprint(chapters[i], previous_contexts[i], following_contexts[i]))
     write_json(state_path, state)
     translations = list(segments)  # Failed material remains visible in the partial artifact.
     table_reports, warnings, pending = [], [], []
@@ -236,24 +254,30 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
         started = time.monotonic()
         pieces = []
         table_index, table_total = 0, sum(b.kind == "table" for b in blocks(segments[index]))
-        for block in blocks(segments[index]):
+        caption = chapters[index]
+        segment_blocks = blocks(segments[index])
+        for block_index, block in enumerate(segment_blocks):
+            if block.kind == 'caption':
+                caption = block.text
             check_cancel(cancel_event)
             if block.kind == "table":
+                if block_index + 1 < len(segment_blocks) and segment_blocks[block_index + 1].kind == 'caption' and re.match(r'(?i)^table\b|^表', segment_blocks[block_index + 1].text):
+                    caption = segment_blocks[block_index + 1].text
                 table_index += 1
                 label = f"表格 {table_index}/{table_total}"
                 activity(index, label)
                 table_config = replace(config, phase="table", request_progress=lambda retry, label=label: activity(index, label, retry))
                 pieces.append(engine.translate_tables_in_text(block.text, table_config, cache_dir, lambda *_a, **_kw: None,
-                                                              consistency_guide=guide, translation_memory=memory, table_reports=local_tables))
+                                                              consistency_guide=guide, translation_memory=memory, table_reports=local_tables, table_context=caption))
             else:
                 pieces.append(block.text)
         table_seconds = time.monotonic() - started
         started = time.monotonic()
         activity(index, "正文")
         body_config = replace(config, alignments=alignments, request_progress=lambda retry: activity(index, "正文", retry))
-        translated = engine.translate_segment("\n\n".join(pieces), excerpts[index - 1][-300:] if index else "", index + 1, len(ids),
+        translated = engine.translate_segment("\n\n".join(pieces), previous_contexts[index], index + 1, len(ids),
                                                config=body_config, cache_dir=cache_dir, consistency_guide=guide, translation_memory=memory,
-                                               quality_warnings=local_warnings, next_context=excerpts[index + 1][:300] if index + 1 < len(ids) else "",
+                                               quality_warnings=local_warnings, next_context=following_contexts[index],
                                                chapter_context=chapters[index])
         for report in local_tables:
             report["segment"] = index + 1
@@ -325,6 +349,12 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
             except (engine.OfflineCacheMiss, ValueError, TypeError):
                 pass  # Older tasks remain readable even when exact alignment cannot be recovered offline.
     document = make_document(state, segments, translations, chapters, sidecar, read_json(artifact(out, 'source_document.json'), {}), config)
+    stable_content_ids(document, previous_document if previous_document.get('identity') == document['identity'] else None)
+    if not previous_document or previous_document.get('identity') != document['identity']:
+        state['content_id_version'] = 2
+    for i, segment in enumerate(document['segments']):
+        segment.update(previous_context=previous_contexts[i], next_context=following_contexts[i])
+    document['context_policy'] = {'version': 2 if config.use_context else 1, 'budget': config.context_budget}
     from review import enrich_document
     enrich_document(out, document)
     write_json(artifact(out, 'review_document.json'), document)
@@ -377,6 +407,11 @@ def _execute(engine, config, raw, root, out, source, sidecar, excluded, state, s
                  f"Header/footer/page lines removed: {excluded}\nReference normalization: {reference_reports}\n" +
                  redact(str(report), [config.api_key]))
     state.update(status=status, quality_report="quality_report.json")
+    if not report.get('export_error'):
+        from review_state import revision_state
+        revision = revision_state(out)
+        revision.update(exported_revision=revision['revision'], export_error=None)
+        write_json(artifact(out, 'review_state.json'), revision)
     write_json(state_path, state)
     progress({"completed": "完成", "needs_review": "完成，但有待检查项", "partial_failed": "部分失败，已保留进度"}[status],
              stage="done", status=status, output_dir=str(out), completed=completed, total=len(ids))

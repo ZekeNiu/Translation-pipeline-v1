@@ -5,7 +5,7 @@ import html
 import threading
 
 from task_paths import artifact
-from task_state import read_json, write_json, fingerprint, file_hash, atomic_write
+from task_state import read_json, write_json, fingerprint, file_hash, atomic_write, source_hash
 
 PDF_RENDER_LOCK = threading.Lock()  # PDFium must not be called concurrently.
 MODES = {'original': '保留原样式', 'simple': '简洁样式', 'off': '关闭'}
@@ -29,7 +29,7 @@ def prepare_layout(out, document, options=None):
         result['header_mode'] = 'simple'
         result['warnings'].append('缺少原 PDF，页眉页脚使用简洁样式。')
         return result
-    if origin.get('hash') and file_hash(source) != origin['hash']:
+    if origin.get('hash') and source_hash(source) != origin['hash']:
         result['header_mode'] = 'simple'
         result['warnings'].append('原 PDF 已变化，页眉页脚使用简洁样式。')
         return result

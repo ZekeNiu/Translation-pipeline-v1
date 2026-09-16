@@ -37,6 +37,21 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(fh, "sha256").hexdigest()
 
 
+_source_hashes = {}
+
+
+def source_hash(path, *, force=False):
+    """Session cache for unchanged source files; integrity checks use file_hash."""
+    path = Path(path).resolve()
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+    if force or key not in _source_hashes:
+        if len(_source_hashes) > 128:
+            _source_hashes.clear()
+        _source_hashes[key] = file_hash(path)
+    return _source_hashes[key]
+
+
 def atomic_write(path: Path, text: str):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

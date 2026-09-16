@@ -62,6 +62,10 @@ class ProviderConfig:
     glossary_prompt: str = ""
     alignments: object = field(default=None, repr=False, compare=False)
     cache_only: bool = False
+    use_context: bool = False
+    context_budget: int | None = None
+    table_contexts: tuple = ()
+    usage_path: object = field(default=None, repr=False, compare=False)
 
     def endpoint(self) -> str:
         base = self.base_url.strip().rstrip("/")
@@ -304,6 +308,11 @@ def call_chat_completion(config: ProviderConfig, messages, timeout: int | None =
 
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {"model": config.model, "messages": messages, "temperature": config.temperature}
+    if config.use_context:
+        from translation_context import budget_for, estimated_tokens, OUTPUT_RESERVE
+        budget = budget_for(config)
+        if sum(estimated_tokens(m['content']) for m in messages) + min(OUTPUT_RESERVE, budget // 3) > budget:
+            raise ValueError('请求超过保守上下文预算；请提高预算或缩小分段。未发送请求。')
     if config.request_progress:
         config.request_progress(config.is_retry)
     started = time.monotonic()
@@ -316,8 +325,15 @@ def call_chat_completion(config: ProviderConfig, messages, timeout: int | None =
         if resp is not None:
             resp.close()
         if config.metrics is not None:
-            config.metrics.append({"seconds": round(time.monotonic() - started, 3), "phase": config.phase,
-                                   "retry": config.is_retry, "glossary_chars": len(config.glossary_prompt), "usage": data.get("usage", {}) if isinstance(data, dict) else {}})
+            record = {"seconds": round(time.monotonic() - started, 3), "phase": config.phase,
+                      "retry": config.is_retry, "glossary_chars": len(config.glossary_prompt), "usage": data.get("usage", {}) if isinstance(data, dict) else {}}
+            config.metrics.append(record)
+            if config.usage_path:
+                from usage_records import append_usage
+                try:
+                    append_usage(config.usage_path, record)
+                except OSError:
+                    record['usage_tracking_error'] = '用量历史写入失败；本次返回用量仍保存在任务报告。'
     try:
         choice = data["choices"][0]
         if choice.get("finish_reason") in {"length", "content_filter"}:
@@ -666,6 +682,8 @@ def _translate_text_batch(
     term_prompt = config.glossary.prompt("\n".join(items)) if config.glossary else ""
     config = replace(config, glossary_prompt=term_prompt)
     system_prompt = TABLE_SYSPROMPT + ("\n\n" + consistency_guide if consistency_guide else "") + term_prompt
+    if config.use_context and config.table_contexts:
+        system_prompt += '\nRead-only context for each array item, in the same order. Translate only the input array, not these labels:\n' + json.dumps(config.table_contexts, ensure_ascii=False)
     check_cancel(config.cancel_event)
     key = _hash_text(config.provider_name, config.base_url, config.model, str(config.temperature), system_prompt, payload)
     cache_path = cache_dir / f"{prefix}_{key}.json"
@@ -755,10 +773,11 @@ def _translate_text_batch_resilient(
             for i, value in exc.accepted.items():
                 result[i] = value
             for i in exc.invalid:
-                result[i] = _translate_text_batch_resilient([items[i]], retry_config, cache_dir, prefix, consistency_guide, failures)[0]
+                child_config = replace(retry_config, table_contexts=(config.table_contexts[i],) if config.table_contexts else ())
+                result[i] = _translate_text_batch_resilient([items[i]], child_config, cache_dir, prefix, consistency_guide, failures)[0]
             return result
-        left = _translate_text_batch_resilient(items[:mid], retry_config, cache_dir, prefix, consistency_guide, failures)
-        right = _translate_text_batch_resilient(items[mid:], retry_config, cache_dir, prefix, consistency_guide, failures)
+        left = _translate_text_batch_resilient(items[:mid], replace(retry_config, table_contexts=config.table_contexts[:mid]), cache_dir, prefix, consistency_guide, failures)
+        right = _translate_text_batch_resilient(items[mid:], replace(retry_config, table_contexts=config.table_contexts[mid:]), cache_dir, prefix, consistency_guide, failures)
         return left + right
 
 
@@ -769,14 +788,23 @@ def translate_table_cells(
     consistency_guide: str = "",
     translation_memory: dict[str, str] | None = None,
     failures: list[str] | None = None,
+    contexts: list[dict] | None = None,
 ) -> list[str]:
     translation_memory = translation_memory if translation_memory is not None else {}
     result = list(items)
     indexed = []
+    contexts = contexts or [{} for _ in items]
+    if len(contexts) != len(items):
+        raise ValueError('Table context length mismatch')
+    def cell_key(index):
+        item = items[index]
+        context = json.dumps(contexts[index], ensure_ascii=False, sort_keys=True) if config.use_context and contexts[index] else ''
+        return _hash_text('cell', config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT,
+            consistency_guide + (config.glossary.prompt(item) if config.glossary else '') + context, item)
     for i, item in enumerate(items):
         if not _needs_translation(item):
             continue
-        key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide + (config.glossary.prompt(item) if config.glossary else ""), item)
+        key = cell_key(i)
         if key not in translation_memory:
             cached = _read_cache(cache_dir / f"cell_{key}.json")
             if cached is not None:
@@ -794,15 +822,18 @@ def translate_table_cells(
             return
         unique_values = []
         unique_indexes = {}
+        unique_contexts = []
         for index, value in batch:
-            if value not in unique_indexes:
-                unique_indexes[value] = []
+            unique = cell_key(index)
+            if unique not in unique_indexes:
+                unique_indexes[unique] = []
                 unique_values.append(value)
-            unique_indexes[value].append(index)
+                unique_contexts.append(contexts[index])
+            unique_indexes[unique].append(index)
         local_failures = []
         translated = _translate_text_batch_resilient(
             unique_values,
-            config,
+            replace(config, table_contexts=tuple(unique_contexts) if config.use_context else ()),
             cache_dir,
             "table",
             consistency_guide,
@@ -810,19 +841,19 @@ def translate_table_cells(
         )
         if failures is not None:
             failures.extend(local_failures)
-        for source, value in zip(unique_values, translated):
+        for source, value, unique in zip(unique_values, translated, unique_indexes):
             if not local_failures or source != value:
-                cell_key = _hash_text("cell", config.base_url, config.model, str(config.temperature), TABLE_SYSPROMPT, consistency_guide + (config.glossary.prompt(source) if config.glossary else ""), source)
-                translation_memory[cell_key] = value
-                _write_cache(cache_dir / f"cell_{cell_key}.json", value)
-            for index in unique_indexes[source]:
+                translation_memory[unique] = value
+                _write_cache(cache_dir / f"cell_{unique}.json", value)
+            for index in unique_indexes[unique]:
                 result[index] = value
         batch = []
         batch_chars = 0
 
     for item in indexed:
         item_len = len(item[1])
-        if batch and (len(batch) >= 32 or batch_chars + item_len > 3500):
+        if batch and (len(batch) >= 32 or batch_chars + item_len > 3500 or
+                      (config.use_context and contexts[item[0]].get('row') != contexts[batch[-1][0]].get('row'))):
             flush()
         batch.append(item)
         batch_chars += item_len
@@ -838,6 +869,7 @@ def translate_tables_in_text(
     consistency_guide: str = "",
     translation_memory: dict[str, str] | None = None,
     table_reports: list[dict] | None = None,
+    table_context: str = '',
 ) -> str:
     if not any(True for _ in html_table_blocks(text)):
         return text
@@ -849,6 +881,7 @@ def translate_tables_in_text(
             return html
         cells = list(iter_cells(tables))
         source_texts = [cell.text for cell in cells]
+        from translation_context import table_contexts
         failures: list[str] = []
         translated_texts = translate_table_cells(
             source_texts,
@@ -857,6 +890,7 @@ def translate_tables_in_text(
             consistency_guide=consistency_guide,
             translation_memory=translation_memory,
             failures=failures,
+            contexts=table_contexts(tables, table_context) if config.use_context else None,
         )
         for cell, translated in zip(cells, translated_texts):
             cell.text = normalize_inline_output(translated)
@@ -907,8 +941,8 @@ def translate_segment(
     protected, placeholders = _protect_segment(segment)
     context = (
         f"Current chapter: {chapter_context[:200]}\n"
-        f"Previous source excerpt (read-only): {prev_context[-300:]}\n"
-        f"Next source excerpt (read-only): {next_context[:300]}\n"
+        f"Previous source excerpt (read-only): {prev_context if config.use_context else prev_context[-300:]}\n"
+        f"Next source excerpt (read-only): {next_context if config.use_context else next_context[:300]}\n"
         "These excerpts are context only. Never translate or output them.\n\n"
     )
     instruction = (
@@ -1024,11 +1058,13 @@ def run(
     glossary=None,
     source_info=None,
     export_options=None,
+    context_budget=None,
 ):
     check_cancel(cancel_event)
     from translation_job import run_job
     config = resolve_provider_config(provider=provider, base_url=base_url, api_key=api_key,
                                      api_key_env=api_key_env, model=model, temperature=temperature, timeout=timeout)
+    config = replace(config, context_budget=context_budget)
     return run_job(sys.modules[__name__], config, input_folder, output_dir, progress_callback=progress_callback,
                    speed_mode=speed_mode, max_workers=max_workers, cancel_event=cancel_event, parse_seconds=parse_seconds, glossary=glossary, source_info=source_info, export_options=export_options)
 
@@ -1047,6 +1083,7 @@ def build_arg_parser():
     parser.add_argument("--timeout", type=int, help="Request timeout in seconds")
     parser.add_argument("--speed-mode", choices=["safe", "balanced", "fast"])
     parser.add_argument("--max-workers", type=int, help="Override translation worker count (1-4)")
+    parser.add_argument('--context-budget', type=int, help='Conservative request budget including output reserve (new tasks)')
     parser.add_argument("--global-glossary", help="Explicitly enable a global glossary CSV")
     parser.add_argument("--book-glossary", help="Explicitly enable a book glossary CSV")
     parser.add_argument("--header-mode", choices=['original', 'simple', 'off'], help="Export page furniture; does not change translation caches")
@@ -1075,6 +1112,7 @@ def main(argv=None):
         timeout=args.timeout,
         speed_mode=args.speed_mode,
         max_workers=args.max_workers,
+        context_budget=args.context_budget,
         progress_callback=lambda info: print(info.get("msg", ""), flush=True),
         glossary=glossary,
         export_options={'header_mode': args.header_mode} if args.header_mode else None,

@@ -5,6 +5,7 @@ from task_state import fingerprint
 
 
 def decision_key(unit, edits):
+    unit = {'source_hash': fingerprint(unit['source']), **unit}
     return fingerprint('review-rules-v2', unit['source'], effective_text(unit, edits),
                        unit.get('glossary_terms', []), unit.get('issues', []), unit.get('reason'))
 
@@ -15,7 +16,7 @@ def disposition(unit, edits):
 
 
 class ReviewIndex:
-    def __init__(self, document, edits):
+    def __init__(self, document, edits, previous=None):
         self.document, self.edits = document, edits
         self.units, self.parents, self.rows = {}, {}, {}
         self.top = []
@@ -33,12 +34,17 @@ class ReviewIndex:
                 self.units[item['id']] = {**item, 'kind': 'omission', 'translated': '',
                     'chapter': '解析遗漏检查', 'source_hash': fingerprint(item['source']), 'issues': [item['reason']]}
                 self.top.append(item['id'])
+        self.cache = previous.cache.copy() if previous else {}
         self.update(edits)
 
     def update(self, edits, ids=None):
         self.edits = edits
         for key in (ids if ids is not None else self.units):
             unit = self.units[key]
+            signature = fingerprint(unit, edits.get('edits', {}).get(key), edits.get('confirmations', {}).get(key), edits.get('dispositions', {}).get(key))
+            if key in self.cache and self.cache[key][0] == signature:
+                self.rows[key] = {**self.cache[key][1], 'unit': unit}
+                continue
             reasons = unit.get('issues', []) if unit['kind'] == 'omission' else active_issues(unit, {**edits, 'confirmations': {}})
             state = disposition(unit, edits)
             if edits.get('confirmations', {}).get(key) == fingerprint(unit['source'], effective_text(unit, edits), reasons, unit.get('glossary_terms', [])):
@@ -48,6 +54,7 @@ class ReviewIndex:
             self.rows[key] = {'unit': unit, 'issues': reasons, 'status': state, 'category': category, 'rank': rank,
                 'chapter': chapter, 'detail': issue_detail(unit, edits, reasons),
                 'search': (' '.join((key, chapter, unit['source'], effective_text(unit, edits)))).casefold()}
+            self.cache[key] = signature, self.rows[key]
 
     def select(self, *, query='', chapter='', category='', status='open', issues_only=True):
         query = query.strip().casefold()

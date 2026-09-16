@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from task_paths import artifact
-from task_state import atomic_write, fingerprint, write_json, file_hash
+from task_state import atomic_write, fingerprint, write_json, file_hash, source_hash
 
 
 def issue_category(reasons, kind=''):
@@ -67,7 +67,7 @@ def suggestion(reason):
     if '公式' in reason or '标记' in reason:
         return '对照原 PDF 核查公式及上下标；不要删除公式中的数值或变量。'
     if '遗漏' in reason:
-        return '对照原页确认是否为正文；在复核窗口选择“恢复漏段”后生成候选，确认保存才插入。'
+        return '对照原页确认是否为正文；在复核窗口选择“AI 改译 / 补译”生成候选，采用并保存才插入；非遗漏可记录无需恢复的依据。'
     if '未翻译' in reason or '术语' in reason:
         return '核对是否应译为中文及本书术语；可编辑或按需生成改译候选。'
     return '若是人名、机构名、缩写或变量，核对后可确认保留；普通英文应补译，可按需生成改译候选。'
@@ -126,7 +126,7 @@ def page_links(out, document, rows):
             links[page] = target.relative_to(out).as_posix()
     if not source.is_file() or source.suffix.lower() != '.pdf':
         return links
-    if origin.get('hash') and file_hash(source) != origin['hash']:
+    if origin.get('hash') and source_hash(source) != origin['hash']:
         return {}  # Never point old locations at a replaced source.
     try:
         with PdfReader(source) as reader:

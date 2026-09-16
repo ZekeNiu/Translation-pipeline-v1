@@ -128,7 +128,10 @@ class OutputTests(unittest.TestCase):
         from task_state import task_lock
         from make_docx import make_docx as real_export
         def guarded(*args, **kwargs):
-            with self.assertRaises(RuntimeError), task_lock(self.out / '_internal'):
+            with self.assertRaises(RuntimeError), task_lock(artifact(self.out, '_export_lock')):
+                pass
+            # Export owns a snapshot, allowing new manual edits during rendering.
+            with task_lock(self.out / '_internal'):
                 pass
             self.assertEqual(kwargs['layout']['header_mode'], 'off')
             return real_export(*args, **kwargs)
@@ -136,6 +139,22 @@ class OutputTests(unittest.TestCase):
             reexport(self.out, export_options={'header_mode': 'off'})
         backups = list(artifact(self.out, '_review_history').glob('*/export_options.json'))
         self.assertTrue(any(read_json(p)['header_mode'] == 'simple' for p in backups))
+
+    def test_edit_during_export_is_saved_for_next_snapshot(self):
+        self.document()
+        from review import save_edit
+        from review_state import revision_state
+        from make_docx import make_docx as real_export
+        def edit_during_render(*args, **kwargs):
+            save_edit(self.out, 's:b0', '测得力为 3。', export=False)
+            return real_export(*args, **kwargs)
+        with patch('make_docx.make_docx', side_effect=edit_during_render):
+            reexport(self.out)
+        self.assertIn('力为 4', (self.out / 'translated.md').read_text(encoding='utf-8'))
+        state = revision_state(self.out)
+        self.assertGreater(state['revision'], state['exported_revision'])
+        reexport(self.out)
+        self.assertIn('测得力为 3', (self.out / 'translated.md').read_text(encoding='utf-8'))
 
 
 class ParseAndLayoutTests(unittest.TestCase):

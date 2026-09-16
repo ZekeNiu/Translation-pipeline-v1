@@ -1,6 +1,7 @@
 """Deterministic integrity checks; semantic suspicions are reported, not proof."""
 from collections import Counter
 from datetime import date
+from decimal import Decimal, InvalidOperation
 import re
 
 TOKEN = re.compile(r"\[\[\[TP_[A-Z]+_\d+\]\]\]")
@@ -38,7 +39,22 @@ def numbers(text):
     text = re.sub(r'(?<=\d)\s+(?=[%‰])', '', text)
     text = re.sub(r'(?<=\d)[xX](?=\d)', '×', text)
     # CJK text normally has no spaces before numbers (for example, 为45秒).
-    return Counter(dates + re.findall(r"(?<![A-Za-z0-9_])\d+(?:[.,]\d+)*(?:%|‰)?", text))
+    text = text.replace('−', '-').replace('﹣', '-')
+    # Normalize range dashes without interpreting the second endpoint as negative.
+    text = re.sub(r'(?<=\d)[–—](?=\d)', '-', text)
+    tokens = re.findall(r"(?<![A-Za-z0-9_])[-+]?\d+(?:[.,]\d+)*(?:[eE][-+]?\d+)?(?:%|‰)?", text)
+    result = []
+    for token in tokens:
+        suffix = token[-1] if token[-1] in '%‰' else ''
+        value = token[:-1] if suffix else token
+        if re.fullmatch(r'[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?', value):
+            value = value.replace(',', '')
+        try:
+            value = str(Decimal(value).normalize())
+        except InvalidOperation:
+            pass  # Ambiguous decimal-comma notation stays distinct.
+        result.append(value + suffix)
+    return Counter(dates + result)
 
 
 def _written_number_count(text, token):

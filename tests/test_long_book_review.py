@@ -81,6 +81,8 @@ class LongReviewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             set_disposition(self.out, ['om'], 'dismissed')
         set_disposition(self.out, ['om'], 'dismissed', note='核对原页：图中已包含')
+        from quality_report import collect_issues
+        self.assertFalse(any(r['id'] == 'om' for r in collect_issues(self.doc, load_edits(self.out, 'test'), {})))
         index = ReviewIndex(self.doc, load_edits(self.out, 'test'))
         self.assertNotIn('om', index.select())
         set_disposition(self.out, ['om'], 'open')

@@ -4,6 +4,7 @@ from task_paths import artifact, translation_lock, public_markdown
 
 from collections import Counter
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 import os
@@ -63,10 +64,16 @@ def recover_alignment(engine, config, segment, expected, cache, guide, previous,
     """Read validated request caches; a cache miss is an explicit offline failure."""
     alignment, pieces, source_tables = [], [], []
     config = replace(config, cache_only=True, metrics=None, request_progress=None, alignments=None)
-    for block in blocks(segment):
+    source_blocks = blocks(segment)
+    caption = chapter
+    for index_in_segment, block in enumerate(source_blocks):
+        if block.kind == 'caption':
+            caption = block.text
         if block.kind == 'table':
+            if index_in_segment + 1 < len(source_blocks) and source_blocks[index_in_segment + 1].kind == 'caption' and re.match(r'(?i)^table\b|^表', source_blocks[index_in_segment + 1].text):
+                caption = source_blocks[index_in_segment + 1].text
             source_tables.append(block.text)
-            pieces.append(engine.translate_tables_in_text(block.text, config, cache, lambda *_: None, consistency_guide=guide))
+            pieces.append(engine.translate_tables_in_text(block.text, config, cache, lambda *_: None, consistency_guide=guide, table_context=caption))
         else:
             pieces.append(block.text)
     result = engine.translate_segment('\n\n'.join(pieces), previous, index, total,
@@ -101,16 +108,26 @@ def recover_existing(out, config):
         raw = translate.normalize_abstract_heading(translate.normalize_source_text(source.read_text(encoding='utf-8')))
         raw, _ = strip_excluded_lines(raw, sidecar)
         prepared = [translate.normalize_references(b.text)[0] if b.kind == 'reference' else b.text for b in blocks(raw)]
-        segments = translate.split_body_into_segments('\n\n'.join(prepared))
+        from translation_context import budget_for, neighbor, chapter_paths, stable_content_ids
+        config = replace(config, use_context=state.get('context_version') == 2, context_budget=state.get('context_budget'))
+        limit = min(10000, budget_for(config) // 8) if config.use_context else 10000
+        segments = translate.split_body_into_segments('\n\n'.join(prepared), max_chunk=limit, min_chunk=min(1800, limit))
         excerpts = [_excerpt(s) for s in segments]
         chapters, chapter, translations = [], '', []
         config = replace(config, glossary=GlossaryMatcher(GlossarySnapshot.from_dict(read_json(artifact(out, 'glossary_snapshot.json'), {}))))
         guide = translate.build_consistency_guide(raw)
+        paths = chapter_paths(segments) if config.use_context else None
+        context_limit = min(1800, budget_for(config) // 24)
+        previous_contexts, next_contexts = [], []
         for i, segment in enumerate(segments):
             headings = re.findall(r'(?m)^#{1,3}\s+.+', segment)
             chapters.append(headings[0] if headings else chapter)
             if headings:
                 chapter = headings[-1]
+            if paths:
+                chapters[-1] = paths[i]
+            previous_contexts.append((neighbor(segments[i - 1], tail=True, limit=context_limit) if config.use_context else excerpts[i - 1][-300:]) if i else '')
+            next_contexts.append((neighbor(segments[i + 1], limit=context_limit) if config.use_context else excerpts[i + 1][:300]) if i + 1 < len(segments) else '')
             key = f's{i:05d}_{fingerprint(segment)[:12]}'
             record = state['segments'].get(key, {})
             path = artifact(out, '_chunks') / f'{key}.md'
@@ -119,11 +136,16 @@ def recover_existing(out, config):
             if path.is_file() and file_hash(path) == record.get('output_hash') and not record.get('alignment'):
                 try:
                     record['alignment'] = recover_alignment(translate, config, segment, translated, artifact(out, '_cache'), guide,
-                        excerpts[i - 1][-300:] if i else '', excerpts[i + 1][:300] if i + 1 < len(segments) else '', chapters[i], i + 1, len(segments))
+                        previous_contexts[i], next_contexts[i], chapters[i], i + 1, len(segments))
                 except (translate.OfflineCacheMiss, ValueError, TypeError):
                     pass
         document = make_document(state, segments, translations, chapters, sidecar,
                                  read_json(artifact(out, 'source_document.json'), read_json(source.parent / 'source_document.json', {})), config)
+        if state.get('content_id_version') == 2:
+            stable_content_ids(document)
+        document['context_policy'] = {'version': 2 if config.use_context else 1, 'budget': config.context_budget}
+        for i, segment in enumerate(document['segments']):
+            segment.update(previous_context=previous_contexts[i], next_context=next_contexts[i])
         backup_artifacts(out)
         write_json(artifact(out, 'review_document.json'), document)
         write_json(artifact(out, 'task_state.json'), state)
@@ -155,6 +177,8 @@ def make_document(state, segments, translations, chapters, sidecar, source_info,
                 unit['issues'].append('本分段翻译未完成，请继续任务。')
             if unit['kind'] == 'table':
                 originals, results = parse_html_tables(unit['source']), parse_html_tables(unit['translated'])
+                from translation_context import table_contexts
+                contexts = table_contexts(originals, current_chapter)
                 left, right = list(iter_cells(originals)), list(iter_cells(results))
                 unit['cells'] = []
                 shape = lambda tables: [[(c.tag, c.attrs) for c in row.cells] for table in tables for row in table.rows]
@@ -165,6 +189,7 @@ def make_document(state, segments, translations, chapters, sidecar, source_info,
                             'translated': dst.text, 'chapter': current_chapter, 'segment': index + 1,
                             'source_hash': fingerprint(src.text), 'page': None, 'bbox': None,
                             'row': positions[j][0], 'column': positions[j][1],
+                            'table_context': contexts[j],
                             'issues': text_issues(src.text, dst.text) + matcher.issues(src.text, dst.text),
                             'glossary_terms': matcher.matches(src.text)})
                 else:
@@ -237,6 +262,17 @@ def effective_text(unit, edits):
     if record.get('source_hash') == unit['source_hash'] and record.get('history'):
         return record['history'][-1]['text']
     return unit['translated']
+
+
+def local_review_context(document, unit):
+    from translation_context import neighbor
+    units = [u for s in document['segments'] for u in s['units']]
+    position = next((i for i, u in enumerate(units) if u['id'] == unit['id']), None)
+    if position is None:
+        position = next((i for i, u in enumerate(units) if any(c['id'] == unit['id'] for c in u.get('cells', []))), 0)
+    before = '\n\n'.join(u['source'] for u in units[max(0, position - 2):position])
+    after = '\n\n'.join(u['source'] for u in units[position + 1:position + 3])
+    return neighbor(before, tail=True), neighbor(after)
 
 
 def render_document(document, edits):
@@ -329,8 +365,8 @@ def backup_artifacts(out):
 
 def _export_review(out, document, edits, *, revision=None, publish_locked=True):
     from make_docx import make_docx
-    enrich_document(out, document)
     if publish_locked:
+        enrich_document(out, document)
         write_json(artifact(out, 'review_document.json'), document)
     text = public_markdown(render_document(document, edits))
     report = read_json(artifact(out, 'quality_report.json'), {})
@@ -380,7 +416,7 @@ def _export_review(out, document, edits, *, revision=None, publish_locked=True):
 
 def save_edit(out, unit_id, text, *, allow_warnings=False, restore=False, expected_revision=None, export=True):
     out = Path(out)
-    with translation_lock(out):
+    with (task_lock(artifact(out, '_export_lock')) if export else nullcontext()), translation_lock(out):
         document = read_json(artifact(out, 'review_document.json'))
         unit = unit_by_id(document, unit_id)
         edits = load_edits(out, document['identity'])
@@ -400,10 +436,10 @@ def save_edit(out, unit_id, text, *, allow_warnings=False, restore=False, expect
         previous['history'].append({'text': text, 'time': datetime.now(timezone.utc).isoformat(),
                                     'issues': issues, 'glossary_terms': unit.get('glossary_terms', [])})
         edits['edits'][unit_id] = previous
-        write_json(artifact(out, 'review_edits.json'), edits)
-        write_json(artifact(out, 'review_document.json'), document)
         from review_state import changed
         changed(out)
+        write_json(artifact(out, 'review_edits.json'), edits)
+        write_json(artifact(out, 'review_document.json'), document)
         if export:
             _export_review(out, document, edits)
         return issues
@@ -421,6 +457,7 @@ def reexport(out, *, export_options=None):
                 from export_layout import MODES
                 if export_options.get('header_mode') not in MODES:
                     raise ValueError('未知页眉页脚样式。')
+                backup_artifacts(out)
                 write_json(artifact(out, 'export_options.json'), {'version': 1, **export_options})
                 changed(out)
             revision = revision_state(out)['revision']
@@ -431,7 +468,7 @@ def reexport(out, *, export_options=None):
 def confirm_unit(out, unit_id, *, expected_revision=None, export=True):
     from quality_report import active_issues
     out = Path(out)
-    with translation_lock(out):
+    with (task_lock(artifact(out, '_export_lock')) if export else nullcontext()), translation_lock(out):
         document = read_json(artifact(out, 'review_document.json'))
         edits = load_edits(out, document['identity'])
         if expected_revision is not None and fingerprint(document, edits) != expected_revision:
@@ -441,9 +478,9 @@ def confirm_unit(out, unit_id, *, expected_revision=None, export=True):
         if export:
             backup_artifacts(out)
         edits.setdefault('confirmations', {})[unit_id] = fingerprint(unit['source'], effective_text(unit, edits), issues, unit.get('glossary_terms', []))
-        write_json(artifact(out, 'review_edits.json'), edits)
         from review_state import changed
         changed(out)
+        write_json(artifact(out, 'review_edits.json'), edits)
         if export:
             _export_review(out, document, edits)
 
@@ -487,8 +524,8 @@ def set_disposition(out, unit_ids, status, *, note='', expected_revision=None):
                     index.rows[key]['issues'], unit.get('glossary_terms', []))
             elif status == 'open':
                 edits.setdefault('confirmations', {}).pop(key, None)
-        write_json(artifact(out, 'review_edits.json'), edits)
         changed(out)
+        write_json(artifact(out, 'review_edits.json'), edits)
 
 
 def propose_omission(out, omission_id, config):
@@ -518,7 +555,7 @@ def propose_omission(out, omission_id, config):
 
 def adopt_omission(out, omission_id, text, *, expected_revision=None, export=True):
     out = Path(out)
-    with translation_lock(out):
+    with (task_lock(artifact(out, '_export_lock')) if export else nullcontext()), translation_lock(out):
         document = read_json(artifact(out, 'review_document.json'))
         edits = load_edits(out, document['identity'])
         if expected_revision is not None and fingerprint(document, edits) != expected_revision:
@@ -535,9 +572,9 @@ def adopt_omission(out, omission_id, text, *, expected_revision=None, export=Tru
         if export:
             backup_artifacts(out)
         recovered['units'].append(unit)
-        write_json(artifact(out, 'recovered_units.json'), recovered)
         from review_state import changed
         changed(out)
+        write_json(artifact(out, 'recovered_units.json'), recovered)
         enrich_document(out, document)
         write_json(artifact(out, 'review_document.json'), document)
         if export:
@@ -554,16 +591,27 @@ def propose_translation(out, unit_id, config):
             raise ValueError('此项不能单独重译。')
         matcher = GlossaryMatcher(current_glossary(out))
         metrics = []
-        config = replace(config, glossary=matcher, metrics=metrics, phase='review')
+        saved = document['config']
+        if any(getattr(config, attr) != saved[key] for attr, key in [('provider_name', 'provider'), ('base_url', 'base_url'), ('model', 'model')]):
+            raise ValueError('局部改译必须使用原任务的翻译服务与模型。')
+        policy = document.get('context_policy', {})
+        config = replace(config, glossary=matcher, metrics=metrics, phase='review', temperature=saved['temperature'],
+                         use_context=True, context_budget=policy.get('budget'))
         cache = artifact(out, '_review_candidates') / uuid.uuid4().hex
         cache.mkdir(parents=True)
         segment = document['segments'][unit['segment'] - 1]
         try:
             if unit['kind'] == 'cell':
-                result = translate.translate_table_cells([unit['source']], config, cache)[0]
+                if not unit.get('table_context'):
+                    from translation_context import table_contexts
+                    parent = next(u for u in all_units(document) if any(c['id'] == unit_id for c in u.get('cells', [])))
+                    contexts = table_contexts(parse_html_tables(parent['source']), parent.get('chapter', ''))
+                    unit['table_context'] = contexts[next(i for i, c in enumerate(parent['cells']) if c['id'] == unit_id)]
+                result = translate.translate_table_cells([unit['source']], config, cache, contexts=[unit.get('table_context', {})])[0]
             else:
-                result = translate.translate_segment(unit['source'], segment['previous_context'], unit['segment'], len(document['segments']), config=config,
-                    cache_dir=cache, next_context=segment['next_context'], chapter_context=unit['chapter'])
+                before, after = local_review_context(document, unit)
+                result = translate.translate_segment(unit['source'], before, unit['segment'], len(document['segments']), config=config,
+                    cache_dir=cache, next_context=after, chapter_context=unit['chapter'])
             validate_edit(unit, result)
             write_json(cache / 'candidate.json', {'unit': unit_id, 'text': result, 'requests': metrics, 'glossary_terms': matcher.matches(unit['source'])})
             return result
