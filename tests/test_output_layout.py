@@ -123,6 +123,20 @@ class OutputTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 reexport(self.out)
 
+    def test_settings_and_export_share_lock_and_preserve_previous_settings(self):
+        self.document()
+        from task_state import task_lock
+        from make_docx import make_docx as real_export
+        def guarded(*args, **kwargs):
+            with self.assertRaises(RuntimeError), task_lock(self.out / '_internal'):
+                pass
+            self.assertEqual(kwargs['layout']['header_mode'], 'off')
+            return real_export(*args, **kwargs)
+        with patch('make_docx.make_docx', side_effect=guarded):
+            reexport(self.out, export_options={'header_mode': 'off'})
+        backups = list(artifact(self.out, '_review_history').glob('*/export_options.json'))
+        self.assertTrue(any(read_json(p)['header_mode'] == 'simple' for p in backups))
+
 
 class ParseAndLayoutTests(unittest.TestCase):
     def test_margin_evidence_preserves_body_with_same_text(self):

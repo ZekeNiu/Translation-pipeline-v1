@@ -162,11 +162,7 @@ class ReviewWindow:
 
     def apply_layout(self):
         options = self.layout_options()
-        def work():
-            with translation_lock(self.out):
-                write_json(artifact(self.out, 'export_options.json'), {'version': 1, **options})
-            reexport(self.out)
-        self.action('export', work)
+        self.action('export', lambda: reexport(self.out, export_options=options))
 
     def open_report(self):
         path = self.out / 'quality_report.html'

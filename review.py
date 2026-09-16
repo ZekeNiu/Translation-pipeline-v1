@@ -390,11 +390,16 @@ def save_edit(out, unit_id, text, *, allow_warnings=False, restore=False, expect
         return issues
 
 
-def reexport(out):
+def reexport(out, *, export_options=None):
     out = Path(out)
     with translation_lock(out):
         document = read_json(artifact(out, 'review_document.json'))
         backup_artifacts(out)
+        if export_options is not None:
+            from export_layout import MODES
+            if export_options.get('header_mode') not in MODES:
+                raise ValueError('未知页眉页脚样式。')
+            write_json(artifact(out, 'export_options.json'), {'version': 1, **export_options})
         _export_review(out, document, load_edits(out, document['identity']))
 
 
