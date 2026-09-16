@@ -91,3 +91,7 @@
 - Real Tk 10k-unit benchmark: load 0.711s, search including debounce 0.222s, switch 0.014s, save 0.081s. Synthetic table/paragraph data only.
 - Second parser resource run: whole 58.94s / GPU total peak 9308MiB; split 47.82s / 8688MiB. Normalized body and table rows exactly equal. GPU readings include unrelated desktop usage; no general performance claim.
 - Backed up current user configuration, glossary store and project environment file outside the repository. Publishing final documentation and small confirmed-cell visual fixes; no original document content uploaded.
+## Long-book release publication audit
+- Final feature commit 305ab34 passed both Windows CI versions (152 tests, run 35057801854), then fast-forwarded to main without rewriting history.
+- Published release/long-book-usability-20260916 at 305ab346925e262178cfa7ea021e604849a6d04c. Remote rollback/pre-long-book-ux-20260916 resolves to 6f32e3a62b158d981356c4f582e027d94ac59622; both verified with remote refs.
+- User document, glossary, configuration backups and validation artifacts remain local and ignored. This audit changes documentation only.

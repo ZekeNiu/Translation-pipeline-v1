@@ -34,7 +34,7 @@ HTML 报告增加本地搜索及类别筛选，数字问题展示原文缺失和
 
 ### 自动与界面检查
 
-- Windows Python 3.11 和 3.14：152 项回归测试通过。功能提交 `54ed78a` 的 [GitHub Actions](https://github.com/ZekeNiu/Translation-pipeline-v1/actions/runs/35057325170) 两个版本均通过。
+- Windows Python 3.11 和 3.14：152 项回归测试通过。发布提交 `305ab34` 的 [GitHub Actions](https://github.com/ZekeNiu/Translation-pipeline-v1/actions/runs/35057801854) 两个版本均通过。
 - 新增覆盖：保存与确认无模型／无导出、导出中断整组恢复、导出期间的新修订不混入快照、遗漏判定撤销、表格聚合、上下文缓存隔离、稳定编号、千页 PDF 覆盖与章节接缝、分片选择性续跑、未知提交不重传、现代 API 图片与位置、密钥不进入任务索引、清理保护人工记录与原页。
 - 一万单元本机实测：索引 0.64 秒；窗口加载 0.71 秒；搜索含 200ms 延迟为 0.22 秒；切换 0.014 秒；保存 0.081 秒。复现：`python tests/long_book_acceptance.py --gui`。这些是本机测量，不保证其他设备相同。
 - 本地真实报告：140 个上层单元、696 个单元格、5 个疑似遗漏；原来的 831 条平铺列表改为 17 个问题分组，仍覆盖 27 个待核对点。未自动采用任何遗漏候选。
@@ -61,7 +61,7 @@ HTML 报告增加本地搜索及类别筛选，数字问题展示原文缺失和
 
 ## 发布与回退
 
-基线为 `6f32e3a`，远端标签 `rollback/pre-long-book-ux-20260916`；开发分支 `codex/long-book-usability` 保留分阶段提交。发布标签为 `release/long-book-usability-20260916`，在验收完成后建立。
+基线为 `6f32e3a`，远端标签 `rollback/pre-long-book-ux-20260916`；开发分支 `codex/long-book-usability` 保留分阶段提交。发布提交 `305ab34` 已合入 `main`，发布标签为 `release/long-book-usability-20260916`；远端标签及对应提交已核对。后续文档审计提交不改变发布代码。
 
 个人配置、词库和项目环境文件另备份到当前用户的 `TranslationPipeline/backups/pre-long-book-ux-20260916`；这些内容不进入 GitHub。首次升级任务时，旧成品与记录保存在 `_internal/_schema_backups/review-v1`，导出事务备份在 `_internal/_export_transactions`，此前的历史仍保留。
 
