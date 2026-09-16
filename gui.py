@@ -489,7 +489,10 @@ class App:
                     state = read_json(artifact(out, 'task_state.json'), {})
                     if state.get('phase') == 'parse':
                         values = state['options']
+                        retry_unknown = self.long_doc_options.get('retry_unknown', False)
                         self.long_doc_options = dict(values.get('parse_options', {}))
+                        if retry_unknown:
+                            self.long_doc_options['retry_unknown'] = True
                         if values.get('context_budget'):
                             self.long_doc_options['context_budget'] = values['context_budget']
                         self.vars['provider'].set(values['provider'])

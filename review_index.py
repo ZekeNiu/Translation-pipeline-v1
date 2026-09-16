@@ -58,7 +58,7 @@ class ReviewIndex:
 
     def select(self, *, query='', chapter='', category='', status='open', issues_only=True):
         query = query.strip().casefold()
-        chosen = set()
+        chosen = {}
         for key, row in self.rows.items():
             if issues_only and (not row['issues'] or (status != 'all' and row['status'] != status)):
                 continue
@@ -68,10 +68,11 @@ class ReviewIndex:
                 continue
             if category and row['category'] != category:
                 continue
-            chosen.add(self.parents.get(key, key))
+            parent = self.parents.get(key, key)
+            chosen[parent] = min(chosen.get(parent, row['rank']), row['rank'])
         result = [key for key in self.top if key in chosen]
         if issues_only:
-            result.sort(key=lambda key: min([self.rows[key]['rank']] + [self.rows[c['id']]['rank'] for c in self.units[key].get('cells', [])]))
+            result.sort(key=lambda key: chosen[key])
         return result
 
     def unresolved(self):

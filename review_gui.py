@@ -209,7 +209,7 @@ class ReviewWindow:
             unit = self.index.units[key]
             issues = self.issues(unit)
             if unit.get('cells'):
-                count = sum(bool(self.issues(c)) for c in unit['cells'])
+                count = sum(bool(self.issues(c)) and self.index.rows[c['id']]['status'] not in {'confirmed', 'dismissed'} for c in unit['cells'])
                 issues = [f'整表 · {count} 个单元格有疑点'] if count else []
             self.tree.insert('', 'end', iid=unit['id'], values=(unit['chapter'] + ' · ' + unit['source'][:60],
                 '、'.join(map(str, unit['pages'])) if unit.get('pages') else unit.get('page') or '未定位', labels.get(unit['kind'], unit['kind']), '；'.join(issues) or ''))
@@ -327,8 +327,9 @@ class ReviewWindow:
             if row > offset + 40 or row + rowspan - 1 <= offset:
                 continue
             issues = self.issues(cell)
+            active = issues and self.index.rows[cell['id']]['status'] not in {'confirmed', 'dismissed'}
             label = tk.Label(self.table_grid, text=f"[{row},{column}] {cell['source']}\n{effective_text(cell, self.edits)}",
-                background='#fff0c2' if issues else '#f4f7fb', justify='left', anchor='nw', wraplength=185,
+                background='#fff0c2' if active else '#f4f7fb', justify='left', anchor='nw', wraplength=185,
                 width=24, relief='solid', borderwidth=1, padx=6, pady=6, cursor='hand2')
             visible_start, visible_end = max(row, offset + 1), min(row + rowspan, offset + 41)
             label.grid(row=visible_start - offset, column=column - 1, rowspan=visible_end - visible_start, columnspan=colspan, sticky='nsew')
